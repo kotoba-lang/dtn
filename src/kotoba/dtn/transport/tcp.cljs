@@ -1,18 +1,17 @@
 (ns kotoba.dtn.transport.tcp
   "A real, working transport for the internet-overlay link kind that
-  kotoba.dtn.link already models — plain TCP, Node.js core `node:net`
-  only (no npm deps). This is the first namespace in kotoba-dtn that
-  actually moves bytes between OS processes; everything else in this
-  library (kotoba.dtn, kotoba.dtn.link, kotoba.dtn.router,
+  kotoba.dtn.link already models — plain TCP. This is the first namespace
+  in kotoba-dtn that actually moves bytes between OS processes; everything
+  else in this library (kotoba.dtn, kotoba.dtn.link, kotoba.dtn.router,
   kotoba.dtn.gateway) is deliberately pure/I/O-free data-model code, and
   stays that way — this namespace is a consumer of those namespaces, not
   a replacement for their purity.
 
-  .cljs, NOT .cljc: it requires real `node:net` socket I/O, so it only
-  runs under a Node.js-hosted ClojureScript runtime (nbb in this repo).
-  The JVM `clojure -M:test` suite does not — and cannot — load `.cljs`
-  files, so this namespace can never regress the existing pure `.cljc`
-  test suite (see this repo's README for the current assertion count).
+  .cljs, NOT .cljc: it requires real socket I/O, so it only runs under a
+  Node.js-hosted ClojureScript runtime (nbb in this repo). The JVM
+  `clojure -M:test` suite does not — and cannot — load `.cljs` files, so
+  this namespace can never regress the existing pure `.cljc` test suite
+  (see this repo's README for the current assertion count).
 
   SCOPE — direct internet-overlay transport only: a peer's IP:host and
   port must already be known (passed in via `:peers` to `start-node!`).
@@ -30,14 +29,26 @@
   will happily rank a (caller-supplied) mesh-radio or satellite link
   too, this namespace just doesn't provide one.
 
-  Wire framing (deliberately the simplest thing that works, no external
-  framing library): each message on the socket is a 4-byte big-endian
-  length prefix followed by that many bytes of UTF-8 `pr-str`'d EDN — the
-  bundle map as produced by `kotoba.dtn/bundle`. Decoded on the reading
-  side with `clojure.edn/read-string` (verified empirically to work
-  under nbb; `cljs.reader/read-string` also works but `clojure.edn` is
-  used here since it round-trips this repo's `:dtn/*` / `:rcs/*`
-  namespaced-keyword maps identically and is the more portable idiom).
+  WIRE FRAMING / SOCKET PLUMBING — delegated to `kotoba.wire`
+  (https://github.com/kotoba-lang/wire, Phase 2 of a shared-lib
+  consolidation across kotoba-lang protocol libraries; Phase 1 was
+  `kotoba-lang/bytes`, which `kotoba-lang/wire` itself depends on). This
+  namespace used to hand-roll its own 4-byte-big-endian-length-prefix
+  framing directly on Node `Buffer`s, its own per-connection
+  buffer-accumulation/defragmentation logic, and its own ad-hoc outbound
+  socket pool (a `:sockets` map, lazy connect-or-reuse) — none of that
+  plumbing was actually DTN-specific. It now calls
+  `kotoba.wire.tcp/start-server!` / `connect-or-reuse!` / `send-framed!`
+  / `close-all!` for exactly that mechanics, and `kotoba.wire.edn/encode`
+  for the one place (`encode-frame`, below) this namespace still needs a
+  raw framed byte payload directly rather than going through a socket.
+  The wire FORMAT itself is unchanged (same 4-byte BE length prefix +
+  UTF-8 `pr-str`'d EDN payload this namespace always used — see
+  `kotoba-lang/wire`'s README for the format spec) — this refactor moved
+  WHERE the mechanics live, not what actually goes on the wire, so it is
+  provably wire-compatible with every bundle this namespace has ever sent
+  or received. Every DTN-specific behavior (store-and-forward, relay,
+  auth, replay checking — everything below this point) is untouched.
 
   Four optional `start-node!` options close real gaps in this transport:
   `:store-path` (see `kotoba.dtn.store`) makes the node's undelivered
@@ -107,9 +118,9 @@
   now checks that match: a bundle addressed to someone else is never
   added to `:inbox` here — it's re-routed via the same `route-and-send!`
   this node uses for its own locally-originated sends (see below)."
-  (:require ["node:net" :as net]
-            [clojure.edn :as edn]
-            [promesa.core :as p]
+  (:require [promesa.core :as p]
+            [kotoba.wire.tcp :as wire]
+            [kotoba.wire.edn :as wire-edn]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.link :as link]
             [kotoba.dtn.router :as router]
@@ -125,50 +136,21 @@
 (declare route-and-send! links-for)
 
 ;; ---------------------------------------------------------------------------
-;; Wire framing — 4-byte big-endian length prefix + UTF-8 pr-str EDN payload
+;; Wire framing — delegated to kotoba.wire.edn / kotoba.wire.tcp. Format is
+;; unchanged: 4-byte big-endian length prefix + UTF-8 pr-str EDN payload.
 ;; ---------------------------------------------------------------------------
 
 (defn encode-frame
-  "bundle -> a single Buffer: [4-byte BE length][UTF-8 pr-str EDN payload].
-  Public (not `defn-`) so test/kotoba/dtn/transport/tcp_demo.cljs can
-  build a raw wire frame directly for its bundle-integrity scenario
-  (sending a deliberately mis-signed bundle over a raw socket, bypassing
-  send-message!'s normal signing path) without duplicating a second
-  implementation of this wire format."
+  "bundle -> a single Node Buffer: the exact wire frame
+  `kotoba.wire.edn/encode` produces (4-byte BE length prefix + UTF-8
+  pr-str EDN payload), converted to a Buffer so it's directly writable to
+  a raw socket. Public (not `defn-`) so test/kotoba/dtn/transport/tcp_demo.cljs
+  can build a raw wire frame directly for its bundle-integrity/replay
+  scenarios (sending a deliberately mis-signed or replayed bundle over a
+  raw socket, bypassing send-message!'s normal signing/sequencing path)
+  without duplicating a second implementation of this wire format."
   [bundle]
-  (let [payload (js/Buffer.from (pr-str bundle) "utf8")
-        len-buf (js/Buffer.alloc 4)]
-    (.writeUInt32BE len-buf (.-length payload) 0)
-    (js/Buffer.concat #js [len-buf payload])))
-
-(defn- frame-write
-  "Write bundle, framed, to socket. callback (may be nil) is Node's usual
-  socket.write callback: called with an Error on failure, or no args (nil)
-  on success once the data is flushed to the OS."
-  [socket bundle callback]
-  (.write socket (encode-frame bundle) callback))
-
-(defn- make-frame-reader
-  "Returns a function suitable as a socket 'data' listener: accumulates
-  chunks in a private buffer, slices out every complete length-prefixed
-  frame as chunks arrive (frames may span multiple TCP packets, or a
-  single packet may contain several frames — both are handled), EDN-decodes
-  each payload, and calls (on-bundle decoded-bundle) once per decoded
-  frame, in order."
-  [on-bundle]
-  (let [buf-atom (atom (js/Buffer.alloc 0))]
-    (fn [chunk]
-      (swap! buf-atom (fn [b] (js/Buffer.concat #js [b chunk])))
-      (loop []
-        (let [buf (deref buf-atom)]
-          (when (>= (.-length buf) 4)
-            (let [frame-len (.readUInt32BE buf 0)]
-              (when (>= (.-length buf) (+ 4 frame-len))
-                (let [payload-str (.toString (.subarray buf 4 (+ 4 frame-len)) "utf8")
-                      rest-buf    (.subarray buf (+ 4 frame-len))]
-                  (reset! buf-atom rest-buf)
-                  (on-bundle (edn/read-string payload-str))
-                  (recur))))))))))
+  (js/Buffer.from (into-array (wire-edn/encode bundle))))
 
 ;; ---------------------------------------------------------------------------
 ;; Inbound handling
@@ -360,7 +342,13 @@
      :inbox []      ; {:message ... :bundle ...} this node has received
      :seen-bundle-ids #{}    ; :dtn/bundle-ids this node has already relayed
      :server <net/Server>
-     :sockets {}}   ; e164 -> open outbound net.Socket, lazily connected
+     :sockets-atom <atom {}>}   ; e164 -> open outbound socket, lazily
+                                ; connected via kotoba.wire.tcp/connect-or-reuse!
+                                ; — a nested atom (not a plain map directly on
+                                ; this node handle) because kotoba.wire.tcp's
+                                ; generic socket-pool primitives operate on
+                                ; their own dedicated pool atom, not a keyed
+                                ; path inside a larger state map.
 
   (plus an internal :accepted bookkeeping set used by stop-node! to close
   inbound connections promptly — not part of the documented contract).
@@ -427,17 +415,22 @@
                                  :store (if store-path (store/load-store store-path) [])
                                  :inbox []
                                  :seen-bundle-ids #{}
-                                 :server nil :sockets {} :accepted #{}})
-        server (net/createServer
-                (fn [socket]
-                  (swap! node-handle-atom update :accepted conj socket)
-                  (.on socket "data" (make-frame-reader
-                                       (fn [bundle] (handle-inbound-bundle! node-handle-atom bundle))))
-                  (.on socket "error" (fn [_e] nil)) ;; a peer dropping mid-write is routine, not fatal
-                  (.on socket "close" (fn [] (swap! node-handle-atom update :accepted disj socket)))))]
+                                 :server nil
+                                 :sockets-atom (atom {})
+                                 :accepted #{}})
+        server (wire/start-server! port
+                (fn [bundle _socket] (handle-inbound-bundle! node-handle-atom bundle)))]
+    ;; Additional bookkeeping listener on the SAME server/'connection' event
+    ;; kotoba.wire.tcp/start-server! already wired up for framing/decoding —
+    ;; Node's EventEmitter dispatches to every registered listener, so this
+    ;; composes cleanly without kotoba.wire.tcp needing to know about
+    ;; DTN's own :accepted-socket tracking.
+    (.on server "connection"
+         (fn [socket]
+           (swap! node-handle-atom update :accepted conj socket)
+           (.on socket "close" (fn [] (swap! node-handle-atom update :accepted disj socket)))))
     (.on server "error" (fn [e] (log! node-handle-atom "tcp: server error " (.-message e))))
-    (.listen server port
-             (fn [] (log! node-handle-atom "tcp: listening on port " port)))
+    (.on server "listening" (fn [] (log! node-handle-atom "tcp: listening on port " port)))
     (swap! node-handle-atom assoc :server server)
     node-handle-atom))
 
@@ -445,16 +438,17 @@
   "Close node-handle-atom's server (stop accepting new connections, and
   proactively close any already-accepted inbound sockets so the server's
   'close' event fires promptly rather than waiting on remote peers) and
-  destroy any cached outbound sockets. Returns a Promise resolved once the
-  server has actually closed (so callers can safely re-`start-node!` on
-  the same port right after)."
+  destroy any cached outbound sockets (kotoba.wire.tcp/close-all! on
+  :sockets-atom). Returns a Promise resolved once the server has actually
+  closed (so callers can safely re-`start-node!` on the same port right
+  after)."
   [node-handle-atom]
   (js/Promise.
    (fn [resolve _reject]
-     (let [{:keys [server sockets accepted]} (deref node-handle-atom)]
-       (doseq [[_e164 sock] sockets] (.destroy sock))
+     (let [{:keys [server sockets-atom accepted]} (deref node-handle-atom)]
+       (wire/close-all! sockets-atom)
        (doseq [sock accepted] (.destroy sock))
-       (swap! node-handle-atom assoc :sockets {} :accepted #{})
+       (swap! node-handle-atom assoc :accepted #{})
        (if server
          (.close server (fn [_err]
                            (swap! node-handle-atom assoc :server nil)
@@ -485,22 +479,11 @@
 ;; Outbound send
 ;; ---------------------------------------------------------------------------
 
-(defn- get-or-create-socket!
-  "Reuse node-handle-atom's cached outbound socket to peer-e164 if one is
-  already open; otherwise open a new one and cache it. The socket is
-  uncached again (on 'error' or 'close') so a dead connection is never
-  reused — the next send attempt will open a fresh one."
-  [node-handle-atom peer-e164 host port]
-  (or (get (:sockets (deref node-handle-atom)) peer-e164)
-      (let [sock (net/createConnection #js {:host host :port port})]
-        (.on sock "error" (fn [_e] (swap! node-handle-atom update :sockets dissoc peer-e164)))
-        (.on sock "close" (fn [] (swap! node-handle-atom update :sockets dissoc peer-e164)))
-        (swap! node-handle-atom update :sockets assoc peer-e164 sock)
-        sock)))
-
 (defn attempt-forward!
   "Try to actually deliver bundle to dest-link's peer right now: get or
-  open a net.Socket to that peer's host:port and write the framed bundle.
+  open a socket to that peer's host:port (kotoba.wire.tcp/connect-or-reuse!
+  against this node's :sockets-atom pool) and write the framed bundle
+  (kotoba.wire.tcp/send-framed!).
 
   When this node has a :peer-secrets entry for the destination peer, the
   bundle is kotoba.dtn.auth/sign-bundle'd (adding :dtn/signature) BEFORE
@@ -515,15 +498,15 @@
   [node-handle-atom bundle dest-link]
   (js/Promise.
    (fn [resolve _reject]
-     (let [{:keys [peers peer-secrets]} (deref node-handle-atom)
+     (let [{:keys [peers peer-secrets sockets-atom]} (deref node-handle-atom)
            peer-e164 (dtn/eid->e164 (:dtn/neighbor dest-link))
            peer      (get peers peer-e164)]
        (if-not peer
          (resolve false)
-         (let [sock       (get-or-create-socket! node-handle-atom peer-e164 (:host peer) (:port peer))
+         (let [sock       (wire/connect-or-reuse! sockets-atom peer-e164 (:host peer) (:port peer))
                secret     (get peer-secrets peer-e164)
                out-bundle (if secret (auth/sign-bundle bundle secret) bundle)]
-           (frame-write sock out-bundle (fn [err] (resolve (not err))))))))))
+           (wire/send-framed! sock out-bundle (fn [err] (resolve (not err))))))))))
 
 (defn- store-bundle!
   "Append bundle onto node-handle-atom's in-memory :store, and — when

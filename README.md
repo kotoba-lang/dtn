@@ -132,17 +132,37 @@ Everything above is intentionally I/O-free — pure `.cljc` data and pure
 decisions. `kotoba.dtn.transport.tcp` (`src/kotoba/dtn/transport/tcp.cljs`)
 is the first namespace in this library that actually moves bytes between
 real OS processes: a plain TCP transport for the `:internet-overlay`
-`:dtn/transport-kind` that `kotoba.dtn.link` already models, using only
-Node's core `node:net` (no npm dependencies). It's `.cljs`, not `.cljc` —
-it only runs under a Node-hosted ClojureScript runtime ([`nbb`](https://github.com/babashka/nbb)
-in this repo) and is never loaded by the JVM `clojure -M:test` suite, so it
-cannot regress the 147 pure-data assertions above. (`kotoba.dtn.store` and
-`kotoba.dtn.auth`, below, keep the same split: their format/canonicalization
-logic (including `kotoba.dtn.auth`'s replay-protection decision functions,
+`:dtn/transport-kind` that `kotoba.dtn.link` already models. It's `.cljs`,
+not `.cljc` — it only runs under a Node-hosted ClojureScript runtime
+([`nbb`](https://github.com/babashka/nbb) in this repo) and is never
+loaded by the JVM `clojure -M:test` suite, so it cannot regress the 147
+pure-data assertions above. (`kotoba.dtn.store` and `kotoba.dtn.auth`,
+below, keep the same split: their format/canonicalization logic
+(including `kotoba.dtn.auth`'s replay-protection decision functions,
 `replay?` / `update-high-water-mark`, and its high-water-mark
 serialize/deserialize pair) is portable `.cljc` and covered by
 `clojure -M:test`, only the actual disk I/O / HMAC-vs-platform-crypto-module
 calls are Node-`.cljs`-specific, behind reader conditionals.)
+
+**Wire framing and socket-pool plumbing now come from
+[`kotoba-lang/wire`](https://github.com/kotoba-lang/wire).** This
+namespace used to hand-roll its own length-prefix framing directly on
+Node `Buffer`s, its own per-connection buffer-accumulation/defragmentation
+logic, and its own ad-hoc outbound socket pool — none of it actually
+DTN-specific. That generic "move EDN maps over a TCP byte stream"
+plumbing has been extracted into `kotoba-lang/wire` (built on
+[`kotoba-lang/bytes`](https://github.com/kotoba-lang/bytes)'s portable
+byte-vector primitives), so `kotoba-lang/turn`'s future relay I/O and
+`kotoba-lang/net`'s future gossip I/O can share it too instead of
+re-implementing the same mechanics. This namespace now calls
+`kotoba.wire.tcp/start-server!` / `connect-or-reuse!` / `send-framed!` /
+`close-all!` for the actual socket I/O. The wire FORMAT itself is
+unchanged (still a 4-byte big-endian length prefix + UTF-8 `pr-str`'d EDN
+payload — see `kotoba-lang/wire`'s README for the format spec), so this
+refactor is provably wire-compatible with everything below — every
+DTN-specific behavior (store-and-forward, relay, auth, replay checking)
+is untouched; only the low-level "how do bytes get framed and pushed down
+a socket" mechanics moved out.
 
 **Scope.** Direct internet-overlay transport only: a peer's host:port must
 already be known (passed to `start-node!` as `:peers`). No discovery, no
@@ -158,7 +178,11 @@ simulated mesh-radio link (see the demo below, scenario 3).
 **Wire framing.** Deliberately the simplest thing that works: each message
 on the socket is a 4-byte big-endian length prefix followed by that many
 bytes of UTF-8 `pr-str`'d EDN (the bundle map `kotoba.dtn/bundle`
-produces), decoded on the read side with `clojure.edn/read-string`.
+produces), decoded on the read side with `clojure.edn/read-string`. As of
+the `kotoba-lang/wire` extraction (above), the actual framing/encoding
+implementation lives in `kotoba.wire.edn` + `kotoba.wire.framing` — this
+namespace only calls it (`encode-frame`, `kotoba.wire.tcp/send-framed!`)
+rather than implementing it inline; the format on the wire is identical.
 
 **Resilience.** `route-and-send!` runs the pure `router/route-decision`,
 then actually attempts delivery; if the peer refuses the connection right
@@ -395,25 +419,29 @@ A minimal demo/dev tool — no config file, no systemd, no TLS:
 
 ```bash
 # Terminal 1 — long-running node, logs every received message + retry pass
-nbb --classpath "src:../phone/src:../html/src:../css/src" bin/dtn_node.cljs \
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
   listen --e164 +818098765432 --port 5100
 
 # Terminal 2 — send one kotoba.rcs-shaped chat message, then exit
-nbb --classpath "src:../phone/src:../html/src:../css/src" bin/dtn_node.cljs \
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
   send --e164 +819012345678 --port 5101 \
   --peer +818098765432:localhost:5100 \
   --to +818098765432 --body "hello"
 ```
 
 (`--classpath` mirrors `deps.edn`'s sibling `:local/root` layout — this
-repo checked out next to `kotoba-lang/phone`, `/html`, `/css`.)
+repo checked out next to `kotoba-lang/phone`, `/html`, `/css`, `/wire`,
+`/bytes`. `/wire` and `/bytes` are needed because
+`kotoba.dtn.transport.tcp` delegates its wire framing/socket-pool
+mechanics to `kotoba.wire` (`kotoba-lang/wire`, built on
+`kotoba-lang/bytes`) — see "Internet-overlay transport" above.)
 
 ### E2E demo (`test/kotoba/dtn/transport/tcp_demo.cljs`)
 
 An executable proof, not a unit test — run it and read the output:
 
 ```bash
-nbb --classpath "src:../phone/src:../html/src:../css/src" \
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
   test/kotoba/dtn/transport/tcp_demo.cljs
 ```
 

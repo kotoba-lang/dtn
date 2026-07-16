@@ -8,6 +8,8 @@ jobs:
       - run: git clone --depth 1 https://github.com/kotoba-lang/phone.git ../phone
       - run: git clone --depth 1 https://github.com/kotoba-lang/html.git ../html
       - run: git clone --depth 1 https://github.com/kotoba-lang/css.git ../css
+      - run: git clone --depth 1 https://github.com/kotoba-lang/wire.git ../wire
+      - run: git clone --depth 1 https://github.com/kotoba-lang/bytes.git ../bytes
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

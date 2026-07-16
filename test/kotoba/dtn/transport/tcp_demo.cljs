@@ -4,14 +4,17 @@
 ;; store-and-forward resilience property the whole design exists for is
 ;; real. Run from this repo's root:
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src" \
+;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
 ;;     test/kotoba/dtn/transport/tcp_demo.cljs
 ;;
 ;; (relative --classpath entries mean this must run with cwd at this
-;; repo's root, with kotoba-lang/phone, /html, /css checked out as
-;; siblings — same layout deps.edn already assumes. Scenario 1 also
-;; `spawn`s a second real `nbb` process, found via $PATH, running
-;; bin/dtn_node.cljs with the same --classpath.)
+;; repo's root, with kotoba-lang/phone, /html, /css, /wire, /bytes checked
+;; out as siblings — same layout deps.edn already assumes (/wire and
+;; /bytes are needed because kotoba.dtn.transport.tcp delegates its wire
+;; framing/socket-pool mechanics to kotoba.wire, built on kotoba.bytes,
+;; instead of implementing them inline). Scenario 1 also `spawn`s a second
+;; real `nbb` process, found via $PATH, running bin/dtn_node.cljs with the
+;; same --classpath.)
 ;;
 ;; Scenarios 4a/4b (added alongside this repo's durable-store +
 ;; bundle-integrity hardening) prove the two gaps that used to undercut
@@ -66,7 +69,7 @@
             [kotoba.dtn.gateway :as gateway]
             [kotoba.dtn.transport.tcp :as tcp]))
 
-(def classpath "src:../phone/src:../html/src:../css/src")
+(def classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src")
 
 (defn- sleep-ms [ms]
   (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))

@@ -8,14 +8,14 @@
 ;; open internet unmodified.
 ;;
 ;; Usage:
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src" bin/dtn_node.cljs \
+;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
 ;;     listen --e164 +819012345678 --port 5100 \
 ;;     --peer +818098765432:localhost:5200 [--peer ...]
 ;;   ;; -> starts a long-running node; logs every message it receives into
 ;;   ;;    :inbox (a "DTN-RECV ..." line) and every retry-store! attempt
 ;;   ;;    (polled every 2s). Stays alive until killed.
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src" bin/dtn_node.cljs \
+;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
 ;;     send --e164 +819012345678 --port 5100 \
 ;;     --peer +818098765432:localhost:5200 \
 ;;     --to +818098765432 --body "hello"
@@ -23,8 +23,11 @@
 ;;   ;;    message, then exits 0 (1 if the send failed and was stored instead).
 ;;
 ;; --classpath is relative to this repo's root and mirrors deps.edn's
-;; sibling :local/root layout (../phone ../html ../css checked out next to
-;; this repo) — see README.md.
+;; sibling :local/root layout (../phone ../html ../css ../wire ../bytes
+;; checked out next to this repo) — see README.md. ../wire and ../bytes
+;; are needed because kotoba.dtn.transport.tcp now delegates its wire
+;; framing/socket-pool mechanics to kotoba.wire (kotoba-lang/wire, built
+;; on kotoba-lang/bytes) instead of implementing them inline.
 
 (ns dtn-node
   (:require [clojure.string :as str]
