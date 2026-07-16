@@ -47,17 +47,36 @@
                 indistinguishable from genuine ones — this is
                 origin-authentication-within-trust-boundary, not a
                 defense against a compromised peer)
-              - provide REPLAY protection. There is no nonce or sequence
-                number dedup here: a captured, validly-signed bundle can
-                be resent verbatim and will re-verify and be re-accepted.
-                This is a real, disclosed gap, not silently out of scope
-                — closing it would need a further mechanism (e.g. a
-                monotonic per-source sequence counter the receiver
-                tracks and rejects replays against) that this namespace
-                does not implement.
 
   An honest tamper-evidence/origin-check for a small, pre-configured peer
   set — not a general Internet-security solution.
+
+  REPLAY PROTECTION (added on top of the above). `kotoba.dtn/bundle`
+  already has a `:dtn/sequence-number` field (defaults to 0, previously
+  never actually incremented by any caller). Because `sign-bundle` signs
+  the ENTIRE bundle map, `:dtn/sequence-number` is already covered by the
+  signature once a peer secret is configured — an attacker without the
+  shared secret cannot forge a higher sequence number, and a captured,
+  validly-signed bundle can be detected as a replay if the receiver
+  tracks the highest sequence number it has already accepted from that
+  exact source and rejects anything at or below it. `replay?` and
+  `update-high-water-mark` below are that check, as pure functions;
+  `kotoba.dtn.transport.tcp` is the impure caller that wires them into
+  the inbound bundle handler (stamping fresh outbound sequence numbers in
+  `send-message!`, checking + updating a per-source high-water mark in
+  `handle-inbound-bundle!`), and `load-high-water-marks!`/
+  `save-high-water-marks!` further below persist that high-water-mark
+  state to disk (mirroring `kotoba.dtn.store`'s durability pattern) so it
+  survives a node restart when `:replay-state-path` is configured.
+
+  **Replay protection is a property of AUTHENTICATED peers ONLY — it
+  only applies when a `:peer-secrets` entry is configured for that
+  source.** Without a real signature backing it, a claimed sequence
+  number proves nothing: an unauthenticated attacker could just as
+  easily forge a high one. This is NOT a general replay-protection
+  mechanism for the transport as a whole — see
+  `kotoba.dtn.transport.tcp`'s docstring for exactly where the
+  authenticated-vs-unauthenticated line is drawn.
 
   CRYPTO IMPLEMENTATION. The bundle-shape/canonicalization logic
   (sign-bundle, verify-bundle, canonical-string below) is pure .cljc and
@@ -79,7 +98,10 @@
   one runtime process, which it is.
 
   Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
-  #?(:cljs (:require ["node:crypto" :as crypto]))
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            #?(:cljs ["node:crypto" :as crypto])
+            #?(:cljs ["node:fs" :as fs]))
   #?(:clj (:import [javax.crypto Mac]
                     [javax.crypto.spec SecretKeySpec])))
 
@@ -143,3 +165,104 @@
     (boolean
      (and (string? claimed)
           (= claimed (hmac-sha256-hex (canonical-string bundle) secret))))))
+
+;; ---------------------------------------------------------------------------
+;; Replay protection — pure decision logic, identical on both platforms
+;;
+;; ONLY meaningful for a bundle whose signature has already verify-bundle'd
+;; true against a real :peer-secrets entry (see namespace docstring) —
+;; kotoba.dtn.transport.tcp is responsible for only calling replay? /
+;; update-high-water-mark once that's established, never for an
+;; unauthenticated peer.
+;; ---------------------------------------------------------------------------
+
+(defn replay?
+  "true iff bundle is a replay (the exact same sequence number seen
+  before) or an out-of-order/older bundle (a lower sequence number than
+  one already accepted), relative to high-water-mark — the highest
+  :dtn/sequence-number already accepted from bundle's claimed
+  :dtn/source, or nil when this is the first bundle ever accepted from
+  that source (never a replay, no matter what sequence number it
+  carries — there is nothing to be lower-or-equal to yet).
+
+  bundle's :dtn/sequence-number missing/nil is treated as 0 (matches
+  kotoba.dtn/bundle's own default when a caller never passes :seq-num)."
+  [bundle high-water-mark]
+  (let [seq-num (or (:dtn/sequence-number bundle) 0)]
+    (boolean (and high-water-mark (<= seq-num high-water-mark)))))
+
+(defn update-high-water-mark
+  "Return hwm-map (a {source-e164 highest-sequence-number-accepted} map)
+  with source-e164's entry advanced to seq-num. Defensive on its own: if
+  seq-num is not actually higher than what's already recorded for
+  source-e164, this is a no-op rather than a regression — callers in
+  practice only ever call this once replay? has already confirmed
+  seq-num is higher, but this function never lowers a high-water mark
+  even if called out of that order.
+
+  Sequence tracking is independent per source: only source-e164's own
+  entry is touched, every other source's high-water mark in hwm-map is
+  untouched."
+  [hwm-map source-e164 seq-num]
+  (update hwm-map source-e164 (fn [prior] (if prior (max prior seq-num) seq-num))))
+
+;; ---------------------------------------------------------------------------
+;; Replay high-water-mark persistence — same pure/impure split as
+;; kotoba.dtn.store: format + parsing is portable .cljc, the actual disk
+;; I/O is Node-only, behind #?(:cljs ...) reader conditionals. Unlike
+;; kotoba.dtn.store's append-only bundle log, this is "latest state, one
+;; small map", not a growing history, so it's always a single
+;; self-contained overwrite (serialize-high-water-marks /
+;; save-high-water-marks!), never an append.
+;; ---------------------------------------------------------------------------
+
+(defn serialize-high-water-marks
+  "hwm-map -> a single pr-str'd EDN line — the complete per-source
+  high-water-mark state as of right now."
+  [hwm-map]
+  (pr-str hwm-map))
+
+(defn deserialize-high-water-marks
+  "The inverse of serialize-high-water-marks. Returns {} when text is
+  blank, nil, fails to parse as EDN, or does not parse to a map —
+  tolerant of a missing/corrupt file the same way kotoba.dtn.store's
+  deserialize-line is tolerant of a malformed line, so a corrupt
+  high-water-mark file degrades to 'no replay history yet' (widening the
+  post-restart replay window — see kotoba.dtn.transport.tcp's
+  :replay-state-path docstring) rather than crashing start-node!."
+  [text]
+  (let [trimmed (when (string? text) (str/trim text))]
+    (if (seq trimmed)
+      (let [parsed (try
+                     (edn/read-string trimmed)
+                     (catch #?(:clj Exception :cljs :default) _e nil))]
+        (if (map? parsed) parsed {}))
+      {})))
+
+#?(:cljs
+   (defn load-high-water-marks
+     "Read path (a replay high-water-mark state file) if it exists,
+     deserializing its contents (see deserialize-high-water-marks).
+     Returns {} when path doesn't exist yet (a node's first-ever run with
+     this :replay-state-path configured)."
+     [path]
+     (if (fs/existsSync path)
+       (deserialize-high-water-marks (str (fs/readFileSync path "utf8")))
+       {})))
+
+#?(:cljs
+   (defn save-high-water-marks!
+     "Overwrite path with hwm-map's current state (fs.writeFileSync — same
+     NOT-crash-atomic caveat as kotoba.dtn.store/rewrite-store!: a crash
+     mid-write can leave this file empty or partially written, in which
+     case load-high-water-marks falls back to {} on the next start,
+     WIDENING the replay window rather than narrowing it, never the
+     reverse — a corrupt/lost high-water-mark file can only make this
+     node accept something it should have rejected, never reject
+     something legitimate). Called synchronously every time a node
+     accepts a new high-water mark from an authenticated peer, same
+     'write to disk in the same step as the in-memory update' discipline
+     kotoba.dtn.transport.tcp's store-bundle! already uses for
+     :store-path."
+     [path hwm-map]
+     (fs/writeFileSync path (serialize-high-water-marks hwm-map))))

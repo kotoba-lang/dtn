@@ -58,3 +58,69 @@
     (let [b (dtn/bundle src dest {:body "hi"})
           mis-signed (auth/sign-bundle b wrong-secret)]
       (is (false? (auth/verify-bundle mis-signed secret))))))
+
+;; ---------------------------------------------------------------------------
+;; Replay protection — pure decision logic (replay? / update-high-water-mark)
+;; ---------------------------------------------------------------------------
+
+(defn- bundle-with-seq [seq-num]
+  (dtn/bundle src dest {:body "hi"} :seq-num seq-num))
+
+(deftest replay?-test
+  (testing "the first-ever message from a source (no prior high-water mark) is never a replay"
+    (is (false? (auth/replay? (bundle-with-seq 0) nil)))
+    (is (false? (auth/replay? (bundle-with-seq 5) nil)))
+    (is (false? (auth/replay? (bundle-with-seq 999999) nil))))
+
+  (testing "a strictly-increasing sequence number is accepted (not a replay)"
+    (is (false? (auth/replay? (bundle-with-seq 6) 5)))
+    (is (false? (auth/replay? (bundle-with-seq 100) 5))))
+
+  (testing "a replayed (exactly equal) sequence number is rejected"
+    (is (true? (auth/replay? (bundle-with-seq 5) 5))))
+
+  (testing "an out-of-order-lower sequence number is rejected"
+    (is (true? (auth/replay? (bundle-with-seq 4) 5)))
+    (is (true? (auth/replay? (bundle-with-seq 0) 5))))
+
+  (testing "missing :dtn/sequence-number is treated as 0"
+    (is (true? (auth/replay? (dissoc (bundle-with-seq 0) :dtn/sequence-number) 0)))
+    (is (false? (auth/replay? (dissoc (bundle-with-seq 0) :dtn/sequence-number) nil)))))
+
+(deftest update-high-water-mark-test
+  (testing "first entry for a source seeds the map"
+    (is (= {"+819012345678" 5}
+           (auth/update-high-water-mark {} "+819012345678" 5))))
+
+  (testing "a higher sequence number advances an existing entry"
+    (is (= {"+819012345678" 10}
+           (auth/update-high-water-mark {"+819012345678" 5} "+819012345678" 10))))
+
+  (testing "a lower/equal sequence number never regresses the recorded high-water mark"
+    (is (= {"+819012345678" 5}
+           (auth/update-high-water-mark {"+819012345678" 5} "+819012345678" 3)))
+    (is (= {"+819012345678" 5}
+           (auth/update-high-water-mark {"+819012345678" 5} "+819012345678" 5))))
+
+  (testing "sequence tracking is independent per source — updating one source's entry"
+    (testing "does not touch another source's entry"
+      (is (= {"+819012345678" 7 "+12125550199" 1}
+             (auth/update-high-water-mark {"+819012345678" 5 "+12125550199" 1}
+                                           "+819012345678" 7))))))
+
+;; ---------------------------------------------------------------------------
+;; Replay high-water-mark persistence format (pure half; disk I/O is
+;; Node-only, see kotoba.dtn.auth's #?(:cljs ...) load-/save-high-water-marks!)
+;; ---------------------------------------------------------------------------
+
+(deftest high-water-mark-serialization-test
+  (testing "round-trips through serialize/deserialize"
+    (let [hwm {"+819012345678" 42 "+12125550199" 7}]
+      (is (= hwm (auth/deserialize-high-water-marks (auth/serialize-high-water-marks hwm))))))
+
+  (testing "deserialize tolerates blank/missing/malformed input"
+    (is (= {} (auth/deserialize-high-water-marks nil)))
+    (is (= {} (auth/deserialize-high-water-marks "")))
+    (is (= {} (auth/deserialize-high-water-marks "   ")))
+    (is (= {} (auth/deserialize-high-water-marks "not-edn-{{{")))
+    (is (= {} (auth/deserialize-high-water-marks "[1 2 3]")))))

@@ -30,13 +30,14 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 126 assertions, all green (`clojure -M:test`, pure `.cljc` only) |
+| Tests | 147 assertions, all green (`clojure -M:test`, pure `.cljc` only) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
-| Internet-overlay transport (real I/O) | yes — plain TCP via nbb, see below; E2E demo green (6/6 scenarios) |
+| Internet-overlay transport (real I/O) | yes — plain TCP via nbb, see below; E2E demo green (7/7 scenarios) |
 | Durable store (`:store-path`) | yes — disk-backed, survives process restart; not crash-atomic on the rewrite step, see below |
-| Bundle integrity (`:peer-secrets`) | yes — pre-shared-secret HMAC-SHA256, tamper-evidence + origin check; NOT a PKI, NOT TLS, NOT replay-protected, see below |
+| Bundle integrity (`:peer-secrets`) | yes — pre-shared-secret HMAC-SHA256, tamper-evidence + origin check; NOT a PKI, NOT TLS, see below |
+| Replay protection (`:dtn/sequence-number` high-water mark) | yes — per-source monotonic sequence tracking, layered on `:peer-secrets`; **only applies to authenticated peers**; high-water marks persist to disk when `:replay-state-path` is configured (in-memory only, resets on restart, otherwise), see below |
 | Multi-hop relay routing (`:routes`) | yes — static/pre-configured single-hop relay via a caller-supplied next-hop table (`router/route-decision`'s `:relay` action), hop-count/`max-hops` loop prevention; NOT automatic route discovery/advertisement, NOT full Contact Graph Routing (RFC 9174), see below |
 | Mesh-radio / satellite transport | no (no hardware in scope; routing logic only, see demo scenario 3) |
 
@@ -135,11 +136,13 @@ real OS processes: a plain TCP transport for the `:internet-overlay`
 Node's core `node:net` (no npm dependencies). It's `.cljs`, not `.cljc` —
 it only runs under a Node-hosted ClojureScript runtime ([`nbb`](https://github.com/babashka/nbb)
 in this repo) and is never loaded by the JVM `clojure -M:test` suite, so it
-cannot regress the 126 pure-data assertions above. (`kotoba.dtn.store` and
+cannot regress the 147 pure-data assertions above. (`kotoba.dtn.store` and
 `kotoba.dtn.auth`, below, keep the same split: their format/canonicalization
-logic is portable `.cljc` and covered by `clojure -M:test`, only the actual
-disk I/O / HMAC-vs-platform-crypto-module calls are Node-`.cljs`-specific,
-behind reader conditionals.)
+logic (including `kotoba.dtn.auth`'s replay-protection decision functions,
+`replay?` / `update-high-water-mark`, and its high-water-mark
+serialize/deserialize pair) is portable `.cljc` and covered by
+`clojure -M:test`, only the actual disk I/O / HMAC-vs-platform-crypto-module
+calls are Node-`.cljs`-specific, behind reader conditionals.)
 
 **Scope.** Direct internet-overlay transport only: a peer's host:port must
 already be known (passed to `start-node!` as `:peers`). No discovery, no
@@ -238,13 +241,82 @@ HMAC-SHA256 per peer, not a PKI, not TLS**:
   rotated).
 - Does **NOT** protect against a peer whose secret has actually leaked —
   a holder of the secret can forge indistinguishable bundles.
-- Provides **no replay protection**: there is no nonce or sequence-number
-  dedup here, so a captured, validly-signed bundle can be resent verbatim
-  and will re-verify and be re-accepted. This is a disclosed, still-open
-  gap, not silently out of scope — see `kotoba.dtn.auth`'s docstring.
+- **DOES now provide replay protection — but ONLY for authenticated
+  peers** (a `:peer-secrets` entry configured for that source). See the
+  next section.
 
 An honest tamper-evidence/origin-check for a small pre-configured peer
 set — not a general Internet-security solution.
+
+**Replay protection (`kotoba.dtn.auth/replay?` +
+`update-high-water-mark`, wired in by `kotoba.dtn.transport.tcp`).** The
+bundle-integrity work above closed forgery/tampering but explicitly
+disclosed a real, still-open gap: a legitimately-signed bundle, captured
+off the wire, could be re-sent later and would be accepted again as if
+it were new — the signature is still valid; nothing checked "have I seen
+this exact bundle, or an older one from this source, before." This is
+now closed, reusing a field `kotoba.dtn/bundle` already had rather than
+inventing a new one: `:dtn/sequence-number` (previously always defaulted
+to 0 and never actually incremented by any caller). Because
+`sign-bundle` signs the ENTIRE bundle map, `:dtn/sequence-number` is
+already covered by the signature once `:peer-secrets` is configured for
+a peer — an attacker without the shared secret cannot forge a higher
+sequence number.
+
+- **Sending side.** Every `start-node!`'d node keeps its own monotonic
+  outbound `:next-sequence-number` counter, seeded from `js/Date.now()`
+  (wall-clock milliseconds) at startup. Every LOCALLY-ORIGINATED
+  `send-message!` call stamps the next value from that counter onto
+  `:dtn/sequence-number` before the bundle is signed. Relaying an inbound
+  bundle onward (the destination-mismatch path) does **NOT** touch
+  `:dtn/sequence-number` — only `:dtn/hop-count` is incremented — because
+  a relay node is not the bundle's source; the original sender's sequence
+  number passes through unchanged.
+- **Receiving side.** Once a bundle has passed HMAC verification for a
+  source this node has a `:peer-secrets` entry for, `handle-inbound-bundle!`
+  additionally checks whether `:dtn/sequence-number` is **strictly
+  greater** than the highest one already accepted from that exact source
+  (a per-source high-water mark kept on the node handle as
+  `:replay-high-water-marks`). If not — an exact resend, or an older
+  bundle arriving out of order — the bundle is **REJECTED**: logged
+  distinctly (`DTN-REPLAY-REJECTED`), never added to `:inbox`, never
+  stored, never relayed onward — the same "security event, not a
+  legitimate delivery" treatment the existing signature-rejection path
+  already gets.
+- **Unauthenticated sources are NOT covered.** When no `:peer-secrets`
+  entry is configured for a source, replay checking does not apply at
+  all — this is a property of authenticated peers only, not a general
+  property of the transport. Without a real signature backing it, a
+  claimed sequence number proves nothing: an unauthenticated attacker
+  could just as easily forge a high one.
+
+**Persistence decision (high-water-mark durability across a restart).**
+An in-memory-only high-water-mark map would reset to empty on every node
+restart — meaning an attacker who captured an old, legitimately-signed
+bundle before the restart could replay it successfully right after,
+silently defeating the protection above. This is handled, not left
+silent: `start-node!` accepts an optional `:replay-state-path <file>`
+(mirrors `:store-path`'s pattern exactly, via new
+`kotoba.dtn.auth/load-high-water-marks` /
+`kotoba.dtn.auth/save-high-water-marks!` functions, same pure-format/impure-I/O
+split as `kotoba.dtn.store`). When set, `:replay-high-water-marks` is
+seeded from that file at startup and durably rewritten every time a new
+high-water mark is accepted from an authenticated peer — verified for
+real (not just in isolated unit tests): a node was started with
+`:replay-state-path`, sent one authenticated message, "restarted"
+(`stop-node!` + a fresh `start-node!` with the same path), and its
+reloaded `:replay-high-water-marks` correctly recovered the prior
+high-water mark. **When `:replay-state-path` is omitted (as in this
+repo's own demo/CLI usage), the high-water-mark map is in-memory only —
+a restart resets it, and a captured bundle from before that restart
+could be replayed successfully right after it.** This is a disclosed
+limitation of the unconfigured case, not a silently-shipped gap: combine
+replay protection with `:replay-state-path` (ideally alongside
+`:store-path`, so both durable-state files persist together) whenever a
+node's replay protection genuinely needs to survive a restart; a node
+that doesn't use `:store-path` either is no worse off than it already
+was — in-memory-only replay tracking is consistent with that node's own
+already-volatile `:store`/`:inbox`.
 
 **Multi-hop relay routing (`:routes`, `kotoba.dtn.router`'s `:relay`
 action).** `route-decision` previously only ever checked whether a
@@ -345,8 +417,8 @@ nbb --classpath "src:../phone/src:../html/src:../css/src" \
   test/kotoba/dtn/transport/tcp_demo.cljs
 ```
 
-Six scenarios, printing `PASS`/`FAIL` per scenario and a final
-`RESULT: N/6 scenarios passed` line (exit 0 iff 6/6):
+Seven scenarios, printing `PASS`/`FAIL` per scenario and a final
+`RESULT: N/7 scenarios passed` line (exit 0 iff 7/7):
 
 1. **Real cross-process delivery** — spawns a real second `nbb` OS process
    running `bin/dtn_node.cljs listen`, sends to its real bound port, and
@@ -385,6 +457,19 @@ Six scenarios, printing `PASS`/`FAIL` per scenario and a final
    directly proving the destination-mismatch fix above), and that B's
    relay was a real routing decision — not an out-of-band cheat — by
    capturing B's own `DTN-RELAY from=... to=... via=...` log line.
+7. **Replay protection** — two nodes share a `:peer-secrets` entry; node
+   A sends one real, legitimately-signed message to node B over TCP
+   (confirmed accepted). The demo captures the EXACT bundle B actually
+   decoded off the wire from B's own `:inbox` entry (not a hand-rolled
+   reconstruction) and resends those exact same signed bytes a second
+   time over a fresh raw socket, bypassing `send-message!`'s normal
+   fresh-sequence-number stamping entirely. The demo confirms B's
+   `:inbox` still has exactly ONE copy of that message (not two) and
+   that a `DTN-REPLAY-REJECTED` line was logged. It then sends a
+   genuinely NEW message (a fresh sequence number, via a normal
+   `send-message!` call) from A to B and confirms THAT one is accepted
+   normally — proving replay rejection doesn't wrongly block legitimate
+   subsequent traffic from the same authenticated source.
 
 ## License
 

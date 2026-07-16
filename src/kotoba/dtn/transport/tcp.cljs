@@ -39,18 +39,64 @@
   used here since it round-trips this repo's `:dtn/*` / `:rcs/*`
   namespaced-keyword maps identically and is the more portable idiom).
 
-  Three optional `start-node!` options close real gaps in this transport:
+  Four optional `start-node!` options close real gaps in this transport:
   `:store-path` (see `kotoba.dtn.store`) makes the node's undelivered
   `:store` survive a process crash/restart instead of being purely
   in-memory, `:peer-secrets` (see `kotoba.dtn.auth`) adds pre-shared
   HMAC-SHA256 signing/verification so a receiving node can detect a
   forged or tampered bundle instead of accepting anything any TCP client
-  sends, and `:routes` (see `kotoba.dtn.router`'s :relay action) lets a
+  sends, `:routes` (see `kotoba.dtn.router`'s :relay action) lets a
   node forward a bundle through a configured intermediate peer when it
   has no direct link to the bundle's final destination — STATIC,
-  pre-configured relay only, no automatic route discovery/advertisement.
-  All three are opt-in and backward compatible: omitted, this namespace
+  pre-configured relay only, no automatic route discovery/advertisement
+  — and `:replay-state-path` (see `kotoba.dtn.auth`'s replay-protection
+  functions, below) persists the per-source sequence-number high-water
+  marks that back replay protection so they survive a restart too. All
+  four are opt-in and backward compatible: omitted, this namespace
   behaves exactly as it did before any of them existed.
+
+  REPLAY PROTECTION. Every locally-originated `send-message!` call stamps
+  a fresh, strictly-increasing `:dtn/sequence-number` onto the outbound
+  bundle BEFORE signing (so the signature — which covers the whole
+  bundle map — covers the sequence number too, once `:peer-secrets` is
+  configured for that peer). On the receiving side, once a bundle has
+  passed HMAC verification for a peer this node has a configured secret
+  for, `handle-inbound-bundle!` additionally checks whether its
+  `:dtn/sequence-number` is strictly greater than the highest one
+  already accepted from that exact source (`kotoba.dtn.auth/replay?`
+  against a per-source high-water mark kept on the node handle as
+  `:replay-high-water-marks`); if not — an exact resend of an old,
+  legitimately-signed bundle, or an older one arriving out of order —
+  the bundle is REJECTED and logged distinctly (`DTN-REPLAY-REJECTED`),
+  the same 'security event, not a delivery to retry later' treatment the
+  existing signature-rejection path already gets: never added to
+  `:inbox`, never stored, never relayed onward. **This only applies to
+  authenticated peers** — a source with no `:peer-secrets` entry
+  configured has no replay protection at all (a claimed sequence number
+  from an unauthenticated sender proves nothing an attacker couldn't
+  also forge), exactly as `kotoba.dtn.auth`'s docstring specifies.
+  Relaying an inbound bundle onward (the destination-mismatch path,
+  below) does NOT touch the original bundle's `:dtn/sequence-number` —
+  only `send-message!`, for this node's own locally-originated sends,
+  stamps a fresh one; a relay node is not the bundle's source.
+
+  `:replay-high-water-marks` is seeded at `start-node!` time from
+  `kotoba.dtn.auth/load-high-water-marks` when `:replay-state-path` is
+  configured (mirrors `:store-path`'s seeding of `:store` from
+  `kotoba.dtn.store/load-store`), and durably
+  `kotoba.dtn.auth/save-high-water-marks!`'d to that same path every time
+  a new high-water mark is actually accepted. **When `:replay-state-path`
+  is omitted, the high-water-mark map is in-memory only — a node restart
+  resets it, meaning an attacker who captured an old, legitimately-signed
+  bundle before that restart could successfully replay it right after
+  the restart.** This is a disclosed limitation of the unconfigured case,
+  not a silent gap: combine replay protection with `:replay-state-path`
+  (ideally alongside `:store-path`, so both durable-state files persist
+  together) whenever a node needs its replay protection to actually
+  survive a restart; a node that only cares about in-process replay
+  protection (e.g. this repo's own demo/CLI runs) can leave it
+  unconfigured, consistent with that node's own already-volatile
+  in-memory `:store`/`:inbox`.
 
   Relaying also closes a related correctness gap: previously, any
   successfully-decoded (and, when configured, signature-verified) inbound
@@ -132,6 +178,15 @@
   [node-handle-atom & parts]
   (println (str "[" (:e164 (deref node-handle-atom)) "] " (apply str parts))))
 
+(defn- peer-secret
+  "The :peer-secrets entry node-handle has configured for bundle's
+  claimed :dtn/source, or nil when none is configured (the common,
+  unauthenticated case). Single lookup shared by verified? (below) and
+  handle-inbound-bundle!'s replay-protection gating, so 'is this source
+  authenticated at all' is computed the same way in both places."
+  [node-handle bundle]
+  (get (:peer-secrets node-handle) (dtn/eid->e164 (:dtn/source bundle))))
+
 (defn- verified?
   "true iff bundle should be accepted onto this node's :inbox, per the
   node's configured :peer-secrets. When node-handle has NO secret
@@ -143,8 +198,7 @@
   — an unsigned, wrongly-signed, or tampered bundle claiming that source
   fails here."
   [node-handle bundle]
-  (let [sender-e164 (dtn/eid->e164 (:dtn/source bundle))
-        secret (get (:peer-secrets node-handle) sender-e164)]
+  (let [secret (peer-secret node-handle bundle)]
     (or (nil? secret) (auth/verify-bundle bundle secret))))
 
 (defn- handle-inbound-bundle!
@@ -153,8 +207,31 @@
   when no :peer-secrets entry is configured for the claimed sender): an
   unverifiable/failed-verification bundle is logged and DROPPED outright
   — never added to :inbox, and never added to :store/retried (it isn't a
-  legitimate delivery to retry-later, it's a security event). Otherwise
-  drops expired bundles (RFC 9171 retention constraint elapsed).
+  legitimate delivery to retry-later, it's a security event).
+
+  Next, ONLY for a bundle whose source IS authenticated (a :peer-secrets
+  entry is configured for it — see peer-secret), checks replay
+  protection (kotoba.dtn.auth/replay?, against this node's
+  :replay-high-water-marks entry for that source): a bundle whose
+  :dtn/sequence-number is not strictly greater than the highest one
+  already accepted from that exact source is a replay (an exact resend)
+  or reordering (an older bundle arriving late) and gets the identical
+  DROPPED-outright treatment as a failed-verification bundle, logged
+  distinctly as DTN-REPLAY-REJECTED. A source with no :peer-secrets entry
+  at all skips this check entirely — replay protection is a property of
+  authenticated peers only (see kotoba.dtn.auth's docstring for why an
+  unauthenticated claimed sequence number can't be trusted). When a
+  bundle passes this check (or the check doesn't apply), and it came from
+  an authenticated source, :replay-high-water-marks is advanced right
+  here — before the expired?/mismatch? branches below run — so a
+  bundle's sequence number is 'spent' (can never be replayed again) the
+  moment it's accepted as fresh, regardless of what happens to it next
+  (dropped for being expired, relayed onward, or added to :inbox). When
+  :replay-state-path is configured, that advance is also durably
+  kotoba.dtn.auth/save-high-water-marks!'d to disk in the same step.
+
+  Otherwise drops expired bundles (RFC 9171 retention constraint
+  elapsed).
 
   Otherwise checks whether bundle's :dtn/destination actually matches
   this node's own EID:
@@ -187,47 +264,74 @@
     loops back to a node it already passed through doesn't get
     re-forwarded a second time by that node."
   [node-handle-atom bundle]
-  (let [now-ms   (js/Date.now)
-        expired? (dtn/expired? bundle now-ms)
-        own-eid  (dtn/eid (:e164 (deref node-handle-atom)))
-        mismatch? (not= (:dtn/destination bundle) own-eid)]
+  (let [now-ms         (js/Date.now)
+        expired?       (dtn/expired? bundle now-ms)
+        own-eid        (dtn/eid (:e164 (deref node-handle-atom)))
+        mismatch?      (not= (:dtn/destination bundle) own-eid)
+        node-handle    (deref node-handle-atom)
+        secret         (peer-secret node-handle bundle)
+        authenticated? (some? secret)
+        sender-e164    (dtn/eid->e164 (:dtn/source bundle))
+        prior-hwm      (get (:replay-high-water-marks node-handle) sender-e164)
+        replayed?      (and authenticated? (auth/replay? bundle prior-hwm))]
     (cond
-      (not (verified? (deref node-handle-atom) bundle))
+      (not (verified? node-handle bundle))
       (log! node-handle-atom "tcp: REJECTED inbound bundle claiming source=" (:dtn/source bundle)
             " — signature missing or invalid (dropped, not stored/retried) "
             (:dtn/bundle-id bundle))
 
-      expired?
-      (log! node-handle-atom "tcp: dropping expired inbound bundle " (:dtn/bundle-id bundle))
-
-      (and mismatch? (contains? (:seen-bundle-ids (deref node-handle-atom)) (:dtn/bundle-id bundle)))
-      (log! node-handle-atom "tcp: dropping duplicate relay of already-seen bundle "
-            (:dtn/bundle-id bundle) " (seen-bundle-id suppression, not full loop detection)")
-
-      mismatch?
-      (let [relay-bundle (update bundle :dtn/hop-count (fnil inc 0))]
-        (swap! node-handle-atom update :seen-bundle-ids conj (:dtn/bundle-id bundle))
-        (let [{:keys [routes] :as node-handle} (deref node-handle-atom)
-              preview (router/route-decision relay-bundle (links-for node-handle)
-                                              :routes routes
-                                              :hop-count (:dtn/hop-count relay-bundle))
-              via-eid (get-in preview [:dtn/via :dtn/neighbor])]
-          (log! node-handle-atom "DTN-RELAY from=" (:dtn/source bundle)
-                " to=" (:dtn/destination bundle)
-                " via=" (or via-eid (name (:dtn/action preview)))
-                " hop-count=" (:dtn/hop-count relay-bundle)
-                " (not addressed to this node — relaying onward, not added to :inbox)")
-          (route-and-send! node-handle-atom relay-bundle)))
+      replayed?
+      (log! node-handle-atom "tcp: REJECTED inbound bundle claiming source=" (:dtn/source bundle)
+            " — DTN-REPLAY-REJECTED sequence-number=" (:dtn/sequence-number bundle)
+            " not greater than already-accepted high-water-mark=" prior-hwm
+            " for this source (replay or reordering; dropped, not stored/retried/relayed) "
+            (:dtn/bundle-id bundle))
 
       :else
-      (let [decoded (or (gateway/bundle->rcs-shaped bundle)
-                         (gateway/bundle->sms bundle))]
-        (swap! node-handle-atom update :inbox conj {:message decoded :bundle bundle})
-        (if decoded
-          (log! node-handle-atom "DTN-RECV from=" (:dtn/source bundle)
-                " body=" (or (:rcs/body decoded) (:phone/body decoded)))
-          (log! node-handle-atom "tcp: received bundle with unrecognized payload shape "
-                (:dtn/bundle-id bundle)))))))
+      (do
+        ;; Bundle is authentic (or the source has no :peer-secrets entry
+        ;; at all, in which case there's nothing to advance) and, when
+        ;; authenticated, is not a replay — "spend" its sequence number
+        ;; now, before deciding what to actually do with the bundle, so
+        ;; it can never be replayed again regardless of what happens next
+        ;; (expired/mismatch/accepted).
+        (when authenticated?
+          (swap! node-handle-atom update :replay-high-water-marks
+                 auth/update-high-water-mark sender-e164 (or (:dtn/sequence-number bundle) 0))
+          (when-let [path (:replay-state-path (deref node-handle-atom))]
+            (auth/save-high-water-marks! path (:replay-high-water-marks (deref node-handle-atom)))))
+        (cond
+          expired?
+          (log! node-handle-atom "tcp: dropping expired inbound bundle " (:dtn/bundle-id bundle))
+
+          (and mismatch? (contains? (:seen-bundle-ids (deref node-handle-atom)) (:dtn/bundle-id bundle)))
+          (log! node-handle-atom "tcp: dropping duplicate relay of already-seen bundle "
+                (:dtn/bundle-id bundle) " (seen-bundle-id suppression, not full loop detection)")
+
+          mismatch?
+          (let [relay-bundle (update bundle :dtn/hop-count (fnil inc 0))]
+            (swap! node-handle-atom update :seen-bundle-ids conj (:dtn/bundle-id bundle))
+            (let [{:keys [routes] :as node-handle} (deref node-handle-atom)
+                  preview (router/route-decision relay-bundle (links-for node-handle)
+                                                  :routes routes
+                                                  :hop-count (:dtn/hop-count relay-bundle))
+                  via-eid (get-in preview [:dtn/via :dtn/neighbor])]
+              (log! node-handle-atom "DTN-RELAY from=" (:dtn/source bundle)
+                    " to=" (:dtn/destination bundle)
+                    " via=" (or via-eid (name (:dtn/action preview)))
+                    " hop-count=" (:dtn/hop-count relay-bundle)
+                    " (not addressed to this node — relaying onward, not added to :inbox)")
+              (route-and-send! node-handle-atom relay-bundle)))
+
+          :else
+          (let [decoded (or (gateway/bundle->rcs-shaped bundle)
+                             (gateway/bundle->sms bundle))]
+            (swap! node-handle-atom update :inbox conj {:message decoded :bundle bundle})
+            (if decoded
+              (log! node-handle-atom "DTN-RECV from=" (:dtn/source bundle)
+                    " body=" (or (:rcs/body decoded) (:phone/body decoded)))
+              (log! node-handle-atom "tcp: received bundle with unrecognized payload shape "
+                    (:dtn/bundle-id bundle)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Node lifecycle
@@ -241,13 +345,17 @@
          :peers {e164 {:host \"...\" :port N} ...}   ; known peers, optional
          :store-path <path>                          ; optional, see below
          :peer-secrets {e164 secret-string ...}       ; optional, see below
-         :routes [{:dtn/destination eid :dtn/next-hop eid} ...]}  ; optional, see below
+         :routes [{:dtn/destination eid :dtn/next-hop eid} ...]   ; optional, see below
+         :replay-state-path <path>}                   ; optional, see below
 
   Returns an atom (the 'node handle') holding:
     {:e164 e164 :port port :peers peers
      :store-path store-path  ; nil unless configured — see below
      :peer-secrets {...}     ; {} unless configured — see below
      :routes [...]           ; [] unless configured — see below
+     :replay-state-path replay-state-path  ; nil unless configured — see below
+     :replay-high-water-marks {}  ; e164 -> highest :dtn/sequence-number accepted from that source
+     :next-sequence-number <int>  ; this node's own monotonic outbound counter, seeded from js/Date.now()
      :store []      ; bundles not yet delivered (store-and-forward)
      :inbox []      ; {:message ... :bundle ...} this node has received
      :seen-bundle-ids #{}    ; :dtn/bundle-ids this node has already relayed
@@ -292,12 +400,30 @@
   the table. When omitted (the common case, and the ONLY case for every
   existing caller before this option existed), behavior is unchanged:
   no route table to consult, so a bundle with no direct link always
-  falls to :store, exactly as before."
-  [{:keys [e164 port peers store-path peer-secrets routes]}]
+  falls to :store, exactly as before.
+
+  :replay-state-path (optional, see kotoba.dtn.auth's replay-protection
+  functions and this namespace's REPLAY PROTECTION docstring section
+  above) — when given, :replay-high-water-marks is seeded at startup
+  from kotoba.dtn.auth/load-high-water-marks'ing this path (so a node
+  restarted after a crash keeps rejecting replays of everything it had
+  already accepted before the restart), and every time a new high-water
+  mark is accepted from an authenticated peer it's durably
+  kotoba.dtn.auth/save-high-water-marks!'d back to this same path. When
+  omitted, :replay-high-water-marks stays purely in-memory — replay
+  protection still works for the lifetime of this process, but resets on
+  restart (see the REPLAY PROTECTION section above for exactly what that
+  does and does not mean)."
+  [{:keys [e164 port peers store-path peer-secrets routes replay-state-path]}]
   (let [node-handle-atom (atom {:e164 e164 :port port :peers (or peers {})
                                  :store-path store-path
                                  :peer-secrets (or peer-secrets {})
                                  :routes (or routes [])
+                                 :replay-state-path replay-state-path
+                                 :replay-high-water-marks (if replay-state-path
+                                                             (auth/load-high-water-marks replay-state-path)
+                                                             {})
+                                 :next-sequence-number (js/Date.now)
                                  :store (if store-path (store/load-store store-path) [])
                                  :inbox []
                                  :seen-bundle-ids #{}
@@ -451,6 +577,28 @@
       (do (store-bundle! node-handle-atom bundle)
           (p/resolved false)))))
 
+(defn- next-sequence-number!
+  "Return the next value from node-handle-atom's own per-node monotonic
+  outbound :dtn/sequence-number counter, incrementing it (a side effect)
+  first. Every LOCALLY-ORIGINATED send from this node (send-message!,
+  below) stamps a fresh, always-increasing sequence number this way — a
+  relayed bundle (handle-inbound-bundle!'s mismatch branch, above) does
+  NOT call this: it only increments :dtn/hop-count on the exact bundle it
+  received, leaving the original sender's :dtn/sequence-number untouched,
+  because a relay node is not the bundle's source.
+
+  Seeded at start-node! time from js/Date.now() (wall-clock milliseconds,
+  see :next-sequence-number in start-node!'s returned node handle) rather
+  than 0: within one process's lifetime this counter is strictly
+  increasing by construction (every call increments it, nothing ever
+  resets it), which is what a receiver's replay protection actually
+  depends on — the js/Date.now() seed is a best-effort extra mitigation
+  against a fresh process picking low numbers a receiver's (unpersisted,
+  post-restart) high-water mark might not have seen, not a substitute for
+  that per-process monotonic guarantee."
+  [node-handle-atom]
+  (:next-sequence-number (swap! node-handle-atom update :next-sequence-number inc)))
+
 (defn send-message!
   "Wrap rcs-chat-message (an :rcs/*-shaped map, see kotoba.dtn.gateway) as
   a DTN bundle from this node to dest-e164 via
@@ -465,11 +613,17 @@
   is the correct seam to stamp a real wall-clock :dtn/creation-timestamp
   onto the bundle, rather than leaving every bundle look permanently
   1970-epoch-old (and therefore immediately :dtn/expired? at any real
-  receiver) by construction."
+  receiver) by construction. Same reasoning for :dtn/sequence-number
+  (see next-sequence-number! and this namespace's REPLAY PROTECTION
+  docstring section above): kotoba.dtn/bundle itself always defaults it
+  to 0, so this transport — the only layer with an actual per-node
+  outbound counter — is the correct seam to stamp a real one."
   [node-handle-atom dest-e164 rcs-chat-message]
   (let [source-e164 (:e164 (deref node-handle-atom))
+        seq-num (next-sequence-number! node-handle-atom)
         bundle (-> (gateway/rcs-shaped->bundle rcs-chat-message dest-e164 source-e164)
-                   (assoc :dtn/creation-timestamp (js/Date.now)))]
+                   (assoc :dtn/creation-timestamp (js/Date.now))
+                   (assoc :dtn/sequence-number seq-num))]
     (route-and-send! node-handle-atom bundle)))
 
 (defn retry-store!

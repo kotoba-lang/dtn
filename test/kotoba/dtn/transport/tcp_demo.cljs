@@ -34,8 +34,22 @@
 ;; fix), and that B's relay was a real routing decision (not an
 ;; out-of-band cheat) by capturing B's own DTN-RELAY log line.
 ;;
-;; Prints PASS/FAIL per scenario, a final "RESULT: N/6 scenarios passed"
-;; line, and exits 0 iff all 6 passed (else 1).
+;; Scenario 6 (added alongside this repo's per-source sequence-number
+;; replay protection) proves a captured, legitimately HMAC-signed bundle
+;; cannot be re-sent later and accepted a second time: two nodes exchange
+;; one real signed message over TCP, the demo captures the EXACT bundle
+;; node B actually decoded off the wire (from B's own :inbox — not a
+;; hand-rolled reconstruction), re-sends those exact same signed bytes a
+;; second time over a fresh raw socket (bypassing send-message!'s normal
+;; fresh-sequence-number stamping entirely), and confirms B's :inbox still
+;; has exactly ONE copy of that message (not two) and logged
+;; DTN-REPLAY-REJECTED. It then confirms a genuinely NEW message (a fresh
+;; sequence number, via a normal send-message! call) is still accepted
+;; right after — proving replay rejection doesn't wrongly block
+;; legitimate subsequent traffic from the same authenticated source.
+;;
+;; Prints PASS/FAIL per scenario, a final "RESULT: N/7 scenarios passed"
+;; line, and exits 0 iff all 7 passed (else 1).
 
 (ns kotoba.dtn.transport.tcp-demo
   (:require ["node:child_process" :as cp]
@@ -346,6 +360,85 @@
             pass?))))))
 
 ;; ---------------------------------------------------------------------------
+;; Scenario 6 — replay protection: per-source :dtn/sequence-number high-water mark
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-6 []
+  (println "\n--- Scenario 6: replay protection (per-source :dtn/sequence-number high-water mark) ---")
+  (let [a-e164 "+819012345678" a-port 5601
+        b-e164 "+818098765432" b-port 5602
+        shared-secret "correct-horse-battery-staple"
+        orig-console-log (.-log js/console)
+        captured-lines (atom [])]
+    (set! (.-log js/console)
+          (fn [& args]
+            (swap! captured-lines conj (apply str args))
+            (apply orig-console-log args)))
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      :peer-secrets {b-e164 shared-secret}})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port :peers {}
+                                      :peer-secrets {a-e164 shared-secret}})
+            delivered-1? (tcp/send-message! node-a b-e164
+                                             {:rcs/message-id (str (random-uuid))
+                                              :rcs/from a-e164 :rcs/to b-e164
+                                              :rcs/body "replay-scenario-original"
+                                              :rcs/content-type "text/plain"})
+            _ (sleep-ms 300)]
+      (let [inbox-after-first (:inbox (deref node-b))
+            original-copies (filter #(= "replay-scenario-original" (get-in % [:message :rcs/body]))
+                                     inbox-after-first)
+            original-count (count original-copies)
+            ;; The exact signed bundle B actually decoded off the wire —
+            ;; not a hand-rolled reconstruction — is the most honest thing
+            ;; to resend for a replay attempt: node-b's own :inbox entry
+            ;; carries {:message ... :bundle <the literal bundle map that
+            ;; arrived, :dtn/signature and :dtn/sequence-number included>}.
+            captured-bundle (:bundle (first original-copies))]
+        (println "  original message delivered?=" delivered-1?
+                  " arrived once in B's inbox?" (= 1 original-count)
+                  " captured signed bundle's :dtn/sequence-number=" (:dtn/sequence-number captured-bundle))
+        (p/let [;; Replay: resend the EXACT captured signed bundle over a
+                ;; fresh raw socket — literally the same old signed bytes
+                ;; going back out — bypassing send-message!'s normal
+                ;; fresh-sequence-number stamping entirely.
+                _ (js/Promise.
+                   (fn [resolve _reject]
+                     (let [sock (net/createConnection #js {:host "127.0.0.1" :port b-port})]
+                       (.on sock "connect"
+                            (fn [] (.write sock (tcp/encode-frame captured-bundle) (fn [_err] (resolve true))))))))
+                _ (sleep-ms 300)]
+          (let [inbox-after-replay (:inbox (deref node-b))
+                replay-count (count (filter #(= "replay-scenario-original" (get-in % [:message :rcs/body]))
+                                             inbox-after-replay))
+                log-output (str/join "\n" @captured-lines)
+                replay-rejected-logged? (str/includes? log-output "DTN-REPLAY-REJECTED")
+                replay-blocked? (and (= 1 replay-count) replay-rejected-logged?)]
+            (println "  replayed the EXACT same signed bundle over a raw socket (bypassing send-message!)")
+            (println "  B's inbox copies of the original message after the replay attempt=" replay-count
+                      " (must stay 1 — a replay must not appear as a 2nd delivery)")
+            (println "  DTN-REPLAY-REJECTED logged?" replay-rejected-logged?)
+            (set! (.-log js/console) orig-console-log)
+            (p/let [delivered-2? (tcp/send-message! node-a b-e164
+                                                      {:rcs/message-id (str (random-uuid))
+                                                       :rcs/from a-e164 :rcs/to b-e164
+                                                       :rcs/body "replay-scenario-followup"
+                                                       :rcs/content-type "text/plain"})
+                    _ (sleep-ms 300)]
+              (let [followup-arrived? (boolean (some #(= "replay-scenario-followup" (get-in % [:message :rcs/body]))
+                                                       (:inbox (deref node-b))))
+                    pass? (and (boolean delivered-1?) (= 1 original-count)
+                               replay-blocked?
+                               (boolean delivered-2?) followup-arrived?)]
+                (println "  genuinely NEW message (fresh sequence number) delivered?=" delivered-2?
+                          " arrived in B's inbox?" followup-arrived?
+                          " (must be true — replay rejection must not block legitimate follow-up traffic)")
+                (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b)]
+                  (println (if pass? "PASS" "FAIL")
+                            " scenario 6: replay protection — captured signed bundle rejected on resend, legitimate follow-up still accepted")
+                  pass?)))))))))
+
+;; ---------------------------------------------------------------------------
 ;; Driver
 ;; ---------------------------------------------------------------------------
 
@@ -354,11 +447,12 @@
             r3  (scenario-3)
             r4a (scenario-4a)
             r4b (scenario-4b)
-            r5  (scenario-5)]
-      (let [results [r1 r2 r3 r4a r4b r5]
+            r5  (scenario-5)
+            r6  (scenario-6)]
+      (let [results [r1 r2 r3 r4a r4b r5 r6]
             passed (count (filter true? results))]
-        (println (str "\nRESULT: " passed "/6 scenarios passed"))
-        (js/process.exit (if (= passed 6) 0 1))))
+        (println (str "\nRESULT: " passed "/7 scenarios passed"))
+        (js/process.exit (if (= passed 7) 0 1))))
     (.catch (fn [e]
               (println "DEMO CRASHED:" e)
               (js/process.exit 1))))
