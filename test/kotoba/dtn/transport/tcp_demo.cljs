@@ -13,17 +13,32 @@
 ;; `spawn`s a second real `nbb` process, found via $PATH, running
 ;; bin/dtn_node.cljs with the same --classpath.)
 ;;
-;; Prints PASS/FAIL per scenario, a final "RESULT: N/3 scenarios passed"
-;; line, and exits 0 iff all 3 passed (else 1).
+;; Scenarios 4a/4b (added alongside this repo's durable-store +
+;; bundle-integrity hardening) prove the two gaps that used to undercut
+;; this library's own stated disaster/carrier-outage resilience purpose
+;; are actually closed: 4a proves the on-disk :store-path log survives a
+;; real (simulated) process restart, not just that the pure
+;; serialize/deserialize functions round-trip in isolation; 4b proves an
+;; HMAC-signed peer accepts a legitimately signed bundle and REJECTS a
+;; bundle forged with the wrong secret sent directly over a raw socket
+;; (bypassing send-message!'s normal signing path entirely).
+;;
+;; Prints PASS/FAIL per scenario, a final "RESULT: N/5 scenarios passed"
+;; line, and exits 0 iff all 5 passed (else 1).
 
 (ns kotoba.dtn.transport.tcp-demo
   (:require ["node:child_process" :as cp]
             ["node:net" :as net]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
             [clojure.string :as str]
             [promesa.core :as p]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.link :as link]
             [kotoba.dtn.router :as router]
+            [kotoba.dtn.auth :as auth]
+            [kotoba.dtn.gateway :as gateway]
             [kotoba.dtn.transport.tcp :as tcp]))
 
 (def classpath "src:../phone/src:../html/src:../css/src")
@@ -158,16 +173,120 @@
     pass?))
 
 ;; ---------------------------------------------------------------------------
+;; Scenario 4a — durable store survives a (simulated) process restart
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-4a []
+  (println "\n--- Scenario 4a: durable (:store-path) store survives a process restart ---")
+  (let [a-e164 "+819012345678" a-port 5401
+        ;; Nobody listens here — attempt-forward! will fail every time,
+        ;; guaranteeing the bundle falls into :store (and, with
+        ;; :store-path configured, gets durably appended to disk too).
+        unreachable-e164 "+10000000000" unreachable-port 5499
+        store-path (path/join (os/tmpdir) (str "dtn-store-demo-" (random-uuid) ".edn"))]
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :store-path store-path
+                                      :peers {unreachable-e164 {:host "127.0.0.1" :port unreachable-port}}})
+            delivered? (tcp/send-message! node-a unreachable-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to unreachable-e164
+                                            :rcs/body "durable-store-check"
+                                            :rcs/content-type "text/plain"})]
+      (let [store-before (:store (deref node-a))
+            file-contents (when (fs/existsSync store-path) (str (fs/readFileSync store-path "utf8")))
+            stored-and-on-disk? (and (not delivered?)
+                                      (= 1 (count store-before))
+                                      (str/includes? (or file-contents "") "durable-store-check"))]
+        (println "  before restart: delivered?=" delivered?
+                  " in-memory :store size=" (count store-before)
+                  " store file on disk contains bundle?" (boolean (and file-contents (str/includes? file-contents "durable-store-check"))))
+        ;; "Restart" the node for real: stop-node! (closes the server,
+        ;; discards the old in-memory atom entirely — nothing carries
+        ;; over in-process) then start-node! again with the SAME
+        ;; :store-path. A fresh atom, loaded fresh from disk.
+        (p/let [_ (tcp/stop-node! node-a)
+                node-a2 (tcp/start-node! {:e164 a-e164 :port a-port :store-path store-path :peers {}})]
+          (let [store-after (:store (deref node-a2))
+                reloaded? (some #(= "durable-store-check" (get-in % [:dtn/payload :rcs/body])) store-after)
+                pass? (and stored-and-on-disk? (boolean reloaded?))]
+            (println "  after \"restart\" (fresh start-node!, same :store-path): reloaded :store size="
+                      (count store-after) " contains the original undelivered bundle?" (boolean reloaded?))
+            (p/let [_ (tcp/stop-node! node-a2)]
+              (fs/unlinkSync store-path)
+              (println (if pass? "PASS" "FAIL")
+                        " scenario 4a: durable store round-trips a bundle across a simulated process restart")
+              pass?)))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 4b — bundle integrity (HMAC-SHA256, kotoba.dtn.auth) is enforced
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-4b []
+  (println "\n--- Scenario 4b: bundle integrity (:peer-secrets HMAC-SHA256) is enforced ---")
+  (let [a-e164 "+819012345678" a-port 5402
+        b-e164 "+818098765432" b-port 5403
+        shared-secret "correct-horse-battery-staple"
+        wrong-secret  "an-attackers-guess"]
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      :peer-secrets {b-e164 shared-secret}})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port :peers {}
+                                      :peer-secrets {a-e164 shared-secret}})
+            delivered? (tcp/send-message! node-a b-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to b-e164
+                                            :rcs/body "authentic-message"
+                                            :rcs/content-type "text/plain"})
+            _ (sleep-ms 300)]
+      (let [legit-arrived? (boolean (some #(= "authentic-message" (get-in % [:message :rcs/body]))
+                                           (:inbox (deref node-b))))]
+        (println "  legitimately signed message: send delivered?=" delivered?
+                  " arrived (and verified) in B's inbox?" legit-arrived?)
+        ;; Build a bundle signed with the WRONG secret, and write it
+        ;; directly to a raw net.Socket using tcp/encode-frame — this
+        ;; deliberately bypasses send-message!/route-and-send!'s normal
+        ;; signing path so we're proving the RECEIVING node's own
+        ;; verification actually runs against real bytes on a real
+        ;; socket, not just that kotoba.dtn.auth's pure functions agree
+        ;; with each other in isolation.
+        (let [forged (-> (gateway/rcs-shaped->bundle
+                           {:rcs/message-id (str (random-uuid))
+                            :rcs/from a-e164 :rcs/to b-e164
+                            :rcs/body "forged-message-should-be-rejected"
+                            :rcs/content-type "text/plain"}
+                           b-e164 a-e164)
+                          (assoc :dtn/creation-timestamp (js/Date.now))
+                          (auth/sign-bundle wrong-secret))
+              frame (tcp/encode-frame forged)]
+          (p/let [_ (js/Promise.
+                     (fn [resolve _reject]
+                       (let [sock (net/createConnection #js {:host "127.0.0.1" :port b-port})]
+                         (.on sock "connect" (fn [] (.write sock frame (fn [_err] (resolve true))))))))
+                  _ (sleep-ms 300)]
+            (let [forged-arrived? (boolean (some #(= "forged-message-should-be-rejected"
+                                                       (get-in % [:message :rcs/body]))
+                                                  (:inbox (deref node-b))))
+                  pass? (and (boolean delivered?) legit-arrived? (not forged-arrived?))]
+              (println "  forged (wrong-secret) bundle sent over a raw socket, bypassing send-message!'s signing")
+              (println "  forged bundle arrived in B's inbox?" forged-arrived? "(must be false — rejected)")
+              (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b)]
+                (println (if pass? "PASS" "FAIL")
+                          " scenario 4b: HMAC-SHA256 signature verification enforced — forged bundle rejected, not accepted")
+                pass?))))))))
+
+;; ---------------------------------------------------------------------------
 ;; Driver
 ;; ---------------------------------------------------------------------------
 
-(-> (p/let [r1 (scenario-1)
-            r2 (scenario-2)
-            r3 (scenario-3)]
-      (let [results [r1 r2 r3]
+(-> (p/let [r1  (scenario-1)
+            r2  (scenario-2)
+            r3  (scenario-3)
+            r4a (scenario-4a)
+            r4b (scenario-4b)]
+      (let [results [r1 r2 r3 r4a r4b]
             passed (count (filter true? results))]
-        (println (str "\nRESULT: " passed "/3 scenarios passed"))
-        (js/process.exit (if (= passed 3) 0 1))))
+        (println (str "\nRESULT: " passed "/5 scenarios passed"))
+        (js/process.exit (if (= passed 5) 0 1))))
     (.catch (fn [e]
               (println "DEMO CRASHED:" e)
               (js/process.exit 1))))

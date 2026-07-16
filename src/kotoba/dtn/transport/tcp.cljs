@@ -37,21 +37,37 @@
   side with `clojure.edn/read-string` (verified empirically to work
   under nbb; `cljs.reader/read-string` also works but `clojure.edn` is
   used here since it round-trips this repo's `:dtn/*` / `:rcs/*`
-  namespaced-keyword maps identically and is the more portable idiom)."
+  namespaced-keyword maps identically and is the more portable idiom).
+
+  Two optional `start-node!` options close real gaps in this transport:
+  `:store-path` (see `kotoba.dtn.store`) makes the node's undelivered
+  `:store` survive a process crash/restart instead of being purely
+  in-memory, and `:peer-secrets` (see `kotoba.dtn.auth`) adds pre-shared
+  HMAC-SHA256 signing/verification so a receiving node can detect a
+  forged or tampered bundle instead of accepting anything any TCP client
+  sends. Both are opt-in and backward compatible: omitted, this
+  namespace behaves exactly as it did before either existed."
   (:require ["node:net" :as net]
             [clojure.edn :as edn]
             [promesa.core :as p]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.link :as link]
             [kotoba.dtn.router :as router]
-            [kotoba.dtn.gateway :as gateway]))
+            [kotoba.dtn.gateway :as gateway]
+            [kotoba.dtn.auth :as auth]
+            [kotoba.dtn.store :as store]))
 
 ;; ---------------------------------------------------------------------------
 ;; Wire framing — 4-byte big-endian length prefix + UTF-8 pr-str EDN payload
 ;; ---------------------------------------------------------------------------
 
-(defn- encode-frame
-  "bundle -> a single Buffer: [4-byte BE length][UTF-8 pr-str EDN payload]."
+(defn encode-frame
+  "bundle -> a single Buffer: [4-byte BE length][UTF-8 pr-str EDN payload].
+  Public (not `defn-`) so test/kotoba/dtn/transport/tcp_demo.cljs can
+  build a raw wire frame directly for its bundle-integrity scenario
+  (sending a deliberately mis-signed bundle over a raw socket, bypassing
+  send-message!'s normal signing path) without duplicating a second
+  implementation of this wire format."
   [bundle]
   (let [payload (js/Buffer.from (pr-str bundle) "utf8")
         len-buf (js/Buffer.alloc 4)]
@@ -95,18 +111,43 @@
   [node-handle-atom & parts]
   (println (str "[" (:e164 (deref node-handle-atom)) "] " (apply str parts))))
 
+(defn- verified?
+  "true iff bundle should be accepted onto this node's :inbox, per the
+  node's configured :peer-secrets. When node-handle has NO secret
+  configured for bundle's claimed :dtn/source, this is a no-op pass
+  (returns true) — backward compatible with every node that doesn't use
+  :peer-secrets at all, same as the existing demo/CLI usage. When a
+  secret IS configured for that source, the bundle must carry a
+  :dtn/signature that verifies against it (kotoba.dtn.auth/verify-bundle)
+  — an unsigned, wrongly-signed, or tampered bundle claiming that source
+  fails here."
+  [node-handle bundle]
+  (let [sender-e164 (dtn/eid->e164 (:dtn/source bundle))
+        secret (get (:peer-secrets node-handle) sender-e164)]
+    (or (nil? secret) (auth/verify-bundle bundle secret))))
+
 (defn- handle-inbound-bundle!
   "Called once per decoded bundle arriving on an accepted server
-  connection. Drops expired bundles outright (RFC 9171 retention
-  constraint elapsed). Otherwise tries to shape the payload as an
-  RCS-shaped or SMS-shaped message (kotoba.dtn.gateway) purely for
-  demo/operator visibility, and appends {:message <decoded-or-nil>
-  :bundle bundle} onto the node's :inbox so an operator (or this repo's
-  E2E demo) can observe what actually arrived."
+  connection. First checks bundle-integrity (see verified? — a no-op
+  when no :peer-secrets entry is configured for the claimed sender): an
+  unverifiable/failed-verification bundle is logged and DROPPED outright
+  — never added to :inbox, and never added to :store/retried (it isn't a
+  legitimate delivery to retry-later, it's a security event). Otherwise
+  drops expired bundles (RFC 9171 retention constraint elapsed).
+  Otherwise tries to shape the payload as an RCS-shaped or SMS-shaped
+  message (kotoba.dtn.gateway) purely for demo/operator visibility, and
+  appends {:message <decoded-or-nil> :bundle bundle} onto the node's
+  :inbox so an operator (or this repo's E2E demo) can observe what
+  actually arrived."
   [node-handle-atom bundle]
   (let [now-ms   (js/Date.now)
         expired? (dtn/expired? bundle now-ms)]
     (cond
+      (not (verified? (deref node-handle-atom) bundle))
+      (log! node-handle-atom "tcp: REJECTED inbound bundle claiming source=" (:dtn/source bundle)
+            " — signature missing or invalid (dropped, not stored/retried) "
+            (:dtn/bundle-id bundle))
+
       expired?
       (log! node-handle-atom "tcp: dropping expired inbound bundle " (:dtn/bundle-id bundle))
 
@@ -129,20 +170,51 @@
 
   opts: {:e164 <this node's own E.164 number>
          :port <TCP port to bind>
-         :peers {e164 {:host \"...\" :port N} ...}}  ; known peers, optional
+         :peers {e164 {:host \"...\" :port N} ...}   ; known peers, optional
+         :store-path <path>                          ; optional, see below
+         :peer-secrets {e164 secret-string ...}}      ; optional, see below
 
   Returns an atom (the 'node handle') holding:
     {:e164 e164 :port port :peers peers
+     :store-path store-path  ; nil unless configured — see below
+     :peer-secrets {...}     ; {} unless configured — see below
      :store []      ; bundles not yet delivered (store-and-forward)
      :inbox []      ; {:message ... :bundle ...} this node has received
      :server <net/Server>
      :sockets {}}   ; e164 -> open outbound net.Socket, lazily connected
 
   (plus an internal :accepted bookkeeping set used by stop-node! to close
-  inbound connections promptly — not part of the documented contract)."
-  [{:keys [e164 port peers]}]
+  inbound connections promptly — not part of the documented contract).
+
+  :store-path (optional, see kotoba.dtn.store) — when given, :store is
+  seeded at startup from kotoba.dtn.store/load-store'ing this path (so a
+  node restarted after a crash picks up exactly where it left off:
+  Resilience for real, not just while the process happens to keep
+  running), and every bundle that later falls back into :store
+  (route-and-send!'s failed-forward path, or a bundle handed straight to
+  :store because no link was reachable) is also durably append-bundle!'d
+  to this same path. When omitted, :store stays purely in-memory —
+  IDENTICAL to this option not existing at all, so every existing caller
+  (the CLI, the E2E demo's scenarios 1-3) is unaffected.
+
+  :peer-secrets (optional, see kotoba.dtn.auth) — a {e164 secret-string}
+  map of pre-shared HMAC secrets, one per peer this node wants
+  origin-authenticated / tamper-evident bundle exchange with. When a
+  secret is configured for a given peer: outbound bundles to that peer
+  are kotoba.dtn.auth/sign-bundle'd before sending, and inbound bundles
+  CLAIMING that peer as :dtn/source are verify-bundle'd before being
+  accepted into :inbox (a missing/invalid signature is logged and
+  dropped — see handle-inbound-bundle!). When no secret is configured
+  for a given peer (the common case, and the ONLY case for every
+  existing caller), send/receive for that peer is identical to before
+  this option existed — no auth is performed, nothing is required or
+  rejected."
+  [{:keys [e164 port peers store-path peer-secrets]}]
   (let [node-handle-atom (atom {:e164 e164 :port port :peers (or peers {})
-                                 :store [] :inbox []
+                                 :store-path store-path
+                                 :peer-secrets (or peer-secrets {})
+                                 :store (if store-path (store/load-store store-path) [])
+                                 :inbox []
                                  :server nil :sockets {} :accepted #{}})
         server (net/createServer
                 (fn [socket]
@@ -218,18 +290,40 @@
   "Try to actually deliver bundle to dest-link's peer right now: get or
   open a net.Socket to that peer's host:port and write the framed bundle.
 
+  When this node has a :peer-secrets entry for the destination peer, the
+  bundle is kotoba.dtn.auth/sign-bundle'd (adding :dtn/signature) BEFORE
+  writing — the wire always carries the signed form when a secret is
+  configured, never the bare bundle. When no secret is configured for
+  this peer, the bundle is written exactly as given — unsigned, same as
+  before this option existed.
+
   Returns a Promise resolving true on a successful write, or false on any
   connection/write error — a peer being down is an expected, routine
   condition here, never thrown as an exception."
   [node-handle-atom bundle dest-link]
   (js/Promise.
    (fn [resolve _reject]
-     (let [peer-e164 (dtn/eid->e164 (:dtn/neighbor dest-link))
-           peer      (get (:peers (deref node-handle-atom)) peer-e164)]
+     (let [{:keys [peers peer-secrets]} (deref node-handle-atom)
+           peer-e164 (dtn/eid->e164 (:dtn/neighbor dest-link))
+           peer      (get peers peer-e164)]
        (if-not peer
          (resolve false)
-         (let [sock (get-or-create-socket! node-handle-atom peer-e164 (:host peer) (:port peer))]
-           (frame-write sock bundle (fn [err] (resolve (not err))))))))))
+         (let [sock       (get-or-create-socket! node-handle-atom peer-e164 (:host peer) (:port peer))
+               secret     (get peer-secrets peer-e164)
+               out-bundle (if secret (auth/sign-bundle bundle secret) bundle)]
+           (frame-write sock out-bundle (fn [err] (resolve (not err))))))))))
+
+(defn- store-bundle!
+  "Append bundle onto node-handle-atom's in-memory :store, and — when
+  :store-path is configured — durably kotoba.dtn.store/append-bundle! it
+  to disk too, in the same synchronous step, so the in-memory store and
+  the on-disk log never observably disagree. The single call site for
+  every place route-and-send! falls back to storing a bundle (both the
+  failed-forward path and the no-reachable-link path)."
+  [node-handle-atom bundle]
+  (swap! node-handle-atom update :store conj bundle)
+  (when-let [path (:store-path (deref node-handle-atom))]
+    (store/append-bundle! path bundle)))
 
 (defn route-and-send!
   "Run the pure kotoba.dtn.router/route-decision against this node's
@@ -237,8 +331,8 @@
     :forward -> attempt-forward!; on failure (the real-world case the
                 pure decision can't know about — a configured link
                 doesn't mean the peer process is actually up right now)
-                fall back to appending bundle onto :store.
-    :store   -> append bundle onto :store directly.
+                fall back to store-bundle!.
+    :store   -> store-bundle! directly.
   Always returns a Promise<boolean> — true iff the bundle was actually
   delivered over the wire just now."
   [node-handle-atom bundle]
@@ -247,11 +341,11 @@
       :forward
       (p/let [delivered? (attempt-forward! node-handle-atom bundle (:dtn/via decision))]
         (when-not delivered?
-          (swap! node-handle-atom update :store conj bundle))
+          (store-bundle! node-handle-atom bundle))
         delivered?)
 
       :store
-      (do (swap! node-handle-atom update :store conj bundle)
+      (do (store-bundle! node-handle-atom bundle)
           (p/resolved false)))))
 
 (defn send-message!
@@ -283,12 +377,28 @@
   retries. Idempotent-ish by construction: re-running this against an
   unreachable peer just re-stores the same bundles again, which is fine
   for this repo's demo/CLI use — no additional dedup bookkeeping here.
-  Returns a Promise resolved once every retry attempt has settled."
+
+  When :store-path is configured, once every retry attempt has settled
+  the on-disk log is kotoba.dtn.store/rewrite-store!'d to exactly match
+  the node's resulting in-memory :store — so bundles that were delivered
+  or expired this pass drop out of the file too, and it doesn't grow
+  forever. (route-and-send!'s own store-bundle! calls, made during this
+  same pass for whatever still fails, already durably appended those
+  bundles individually — this rewrite is what actually removes the
+  now-stale earlier entries.) See kotoba.dtn.store's docstring for why
+  this specific step is NOT crash-atomic.
+
+  Returns a Promise resolved once every retry attempt has settled (and,
+  when :store-path is configured, the disk log has been rewritten)."
   [node-handle-atom]
   (let [now-ms (js/Date.now)
-        {:keys [kept expired]} (router/expire-store (:store (deref node-handle-atom)) now-ms)]
+        {:keys [kept expired]} (router/expire-store (:store (deref node-handle-atom)) now-ms)
+        store-path (:store-path (deref node-handle-atom))]
     (doseq [b expired]
       (log! node-handle-atom "tcp: retry-store! dropping expired bundle " (:dtn/bundle-id b)))
     (log! node-handle-atom "tcp: retry-store! attempting " (count kept) " stored bundle(s)")
     (swap! node-handle-atom assoc :store [])
-    (p/all (map (fn [b] (route-and-send! node-handle-atom b)) kept))))
+    (p/let [results (p/all (map (fn [b] (route-and-send! node-handle-atom b)) kept))]
+      (when store-path
+        (store/rewrite-store! store-path (:store (deref node-handle-atom))))
+      results)))
