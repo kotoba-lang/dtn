@@ -30,7 +30,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 175 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence`, see below) |
+| Tests | 212 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence` + 37 in `kotoba.dtn.transport.turn-relay`, see below) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
@@ -41,7 +41,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | Multi-hop relay routing (`:routes`) | yes — static/pre-configured single-hop relay via a caller-supplied next-hop table (`router/route-decision`'s `:relay` action), hop-count/`max-hops` loop prevention; NOT automatic route discovery/advertisement, NOT full Contact Graph Routing (RFC 9174), see below |
 | Peer discovery (`kotoba.dtn.discovery`, real I/O) | yes — gossip-based presence broadcast/discovery built directly on [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)'s real gossip transport; E2E demo green (3/3 scenarios); NOT a DHT, NOT authenticated (a presence announcement is trusted at face value), polling-based (not push/callback), see below |
 | Mesh-radio / satellite transport | no (no hardware in scope; routing logic only, see demo scenario 3) |
-| NAT traversal | no — explicitly deferred to a future `kotoba-lang/org-ietf-turn` phase; TURN is UDP-based and this repo's transport is TCP-based, a materially different, larger problem than gossip-based discovery |
+| NAT traversal (`kotoba.dtn.transport.udp`, real I/O) | yes — genuinely scoped: a UDP-native sibling transport (`node:dgram`, no TURN by default) plus an OPTIONAL relay path through a real [`kotoba-lang/org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn) TURN listener for exactly ONE configured peer per node; E2E demo green (3/3 scenarios, genuinely bidirectional); NOT full ICE (RFC 8445) — no NAT-type detection, no candidate gathering/connectivity checks, no automatic Allocate/permission refresh (single-shot handshake at `start-node!` time only, so relayed connectivity silently lapses ~5 minutes in), no multi-peer relaying from one node, see below |
 
 ## Contract
 
@@ -177,10 +177,14 @@ discovery gap this used to name as future work is now closed, at the
 node's own reachability over, and consumes peer announcements from, a
 real [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)
 gossip mesh, and populates a *running* node handle's `:peers` (this exact
-option) dynamically — see "Peer discovery" below. NAT traversal (via a
-future `kotoba-lang/org-ietf-turn` relay) remains explicitly future work —
-TURN is UDP-based and this transport is TCP-based, bridging them is a
-materially different, larger problem than gossip-based discovery.
+option) dynamically — see "Peer discovery" below. NAT traversal via a
+`kotoba-lang/org-ietf-turn` relay remains explicitly future work **for
+THIS namespace specifically** — TURN is UDP-based and this transport is
+TCP-based, bridging them is a materially different, larger problem than
+gossip-based discovery, and `kotoba.dtn.transport.tcp` itself is
+deliberately unmodified (still TCP-only, no TURN awareness). That gap is
+now closed at a NEW, separate UDP-native sibling transport instead — see
+"NAT traversal" below.
 Mesh-radio and satellite transports are **not implemented** — no such
 hardware exists in this dev environment — but `kotoba.dtn.router`'s
 priority ordering over transport kinds is still real and tested against a
@@ -389,8 +393,10 @@ with PEER discovery (a node learning a *direct* neighbor's host:port),
 which `kotoba.dtn.discovery` (see "Peer discovery" below) now closes —
 that's a materially smaller problem (flat gossip presence broadcast, no
 routing-table computation) than the route-advertisement gap named here.
-NAT traversal (via a future `kotoba-lang/org-ietf-turn` relay) also
-remains deferred, same as before.
+NAT traversal for `kotoba.dtn.transport.tcp` specifically also remains
+deferred, same as before — see "NAT traversal" below for the separate UDP
+sibling transport that now closes this gap via a real
+`kotoba-lang/org-ietf-turn` relay.
 
 **Loop prevention (`:dtn/hop-count`, `max-hops`).** Rather than adding a
 `:dtn/hop-count` field to `kotoba.dtn/bundle`'s pure constructor, hop
@@ -685,6 +691,154 @@ Three scenarios, printing `PASS`/`FAIL` per scenario and a final
    discovers BOTH pre-existing A and B, with the correct host:port —
    proving discovery is symmetric, not just whichever order happened to
    be tested first.
+
+## NAT traversal (`kotoba.dtn.transport.udp`, real I/O)
+
+Every namespace above this point named the same open gap and deliberately
+did not attempt it: `kotoba.dtn.transport.tcp` is TCP, TURN relays UDP, and
+bridging the two was called "a materially different, larger problem than
+gossip-based discovery." This section closes that gap — honestly, at a
+genuinely scoped-down level, not with a full ICE implementation.
+
+`src/kotoba/dtn/transport/udp.cljs` (`kotoba.dtn.transport.udp`, `.cljs`,
+Node-only, same real-I/O split every transport namespace in this repo
+uses) is a UDP-native sibling to `kotoba.dtn.transport.tcp`, deliberately
+simpler for the non-relayed case: UDP preserves datagram boundaries, so
+unlike TCP there is no stream to frame — a whole `pr-str`'d EDN bundle,
+UTF-8 encoded, IS one datagram, with no `kotoba-lang/wire` length-prefix
+framing involved at all. It reuses `kotoba.dtn.router`, `kotoba.dtn.auth`,
+`kotoba.dtn.store`, and `kotoba.dtn.gateway` for real, exactly as
+`kotoba.dtn.transport.tcp` already does (durable `:store-path`,
+`:peer-secrets` HMAC-SHA256 signing/verification, `:dtn/sequence-number`
+replay protection, `:routes` static relay — all identical semantics,
+transport-agnostic). The transport-layer orchestration glue
+(`handle-inbound-bundle!`, `links-for`, `route-and-send!`, etc.) is this
+namespace's OWN copy, not shared with `kotoba.dtn.transport.tcp` —
+`tcp.cljs` is deliberately untouched by this work, byte-for-byte, so a
+shared extraction was out of scope (see the namespace's own docstring for
+the full rationale). `start-node!` here returns a `Promise<node-handle>`,
+not a bare atom like `kotoba.dtn.transport.tcp/start-node!` does — binding
+a UDP socket, and (when configured) completing a real multi-round-trip
+TURN handshake, are both inherently asynchronous.
+
+**The NAT-traversal capability.** An OPTIONAL `:turn-relay` option on
+`start-node!` — `{:server-host .. :server-port .. :shared-secret ..
+:peer-address {:address .. :port ..}}` — treats that node as NAT'd: at
+startup it performs a REAL RFC 8656 Allocate, then a REAL CreatePermission
+for the one configured `:peer-address`, against a REAL, already-running
+[`kotoba-lang/org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn)
+`kotoba.turn.listener` (org-ietf-turn's own real UDP relay — consumed
+as-is here, never modified; see that repo's own README for what it
+implements). The client-side STUN-message-construction sequence
+(`build-allocate-request` / `build-create-permission-request` /
+`build-send-indication`) is adapted from org-ietf-turn's own
+`test/kotoba/turn/listener_demo.cljs` client-building pattern into a new
+pure `.cljc` namespace, `src/kotoba/dtn/transport/turn_relay.cljc`
+(`kotoba.dtn.transport.turn-relay`) — zero I/O, testable under plain JVM
+`clojure -M:test` (37 of this repo's 212 total assertions), including the
+"is this inbound datagram a relayed Data indication or a directly-received
+raw bundle" classification decision (`classify-inbound-datagram`) a
+TURN-relay-configured node's socket handler needs.
+
+Once the handshake succeeds: every outbound bundle from a `:turn-relay`
+node is wrapped in a real STUN Send indication and sent to the TURN
+server, addressed to the one permitted peer; every inbound datagram on
+that node's socket is classified, and a real STUN Data indication is
+unwrapped and delivered into the normal bundle-handling pipeline exactly
+as if it had arrived directly. **The real capability this adds:** a dtn
+node that is not directly reachable can still have its bundles relayed
+through a TURN server to a peer that only ever sends to that node's
+TURN-allocated relayed address, and can reply back through the same relay
+— genuine bidirectional delivery, proven for real in the E2E demo below,
+not simulated.
+
+**What this deliberately is NOT — same "claim exactly what was built"
+discipline as every other namespace in this repo:**
+
+- **NOT full ICE (RFC 8445).** No STUN-based own-NAT-type detection, no
+  candidate gathering, no connectivity-check exchange between peers to
+  pick the best of several candidate pairs. There is exactly ONE candidate
+  for reaching a NAT'd peer — its TURN-relayed address — supplied directly
+  by the caller, never discovered or negotiated.
+- **NOT automatic permission/allocation refresh.** Allocate +
+  CreatePermission is called exactly ONCE, at `start-node!` time. RFC
+  8656's default permission lifetime is 300s and allocation lifetime is
+  600s (`kotoba.turn.allocation`'s own defaults) — a `:turn-relay` node
+  that stays up past ~5 minutes will have its permission silently expire
+  server-side, after which relayed traffic in both directions starts being
+  silently dropped by the TURN server with zero warning from this
+  namespace. A production implementation needs a scheduled Refresh well
+  before both expire — not implemented here.
+- **NOT relay-unreachable fallback.** If the TURN server goes down, or a
+  Send indication is simply lost (UDP, no retransmission), this namespace
+  does not fall back to a direct send and does not retry the relay — there
+  is no ICE-style "try the next candidate" logic because there is only
+  ever the one candidate. A failed relay send just falls into the node's
+  normal `:store` (store-and-carry), same as any other undelivered bundle.
+- **NOT multi-peer relaying from one node.** CreatePermission is called
+  exactly once, for the single `:peer-address` given in `:turn-relay`'s
+  config — this scoped version is single-peer-per-node.
+- **NOT the ChannelBind fast path.** Every relayed message pays full STUN
+  Send-indication/Data-indication framing overhead; org-ietf-turn's
+  listener supports the lighter post-ChannelBind ChannelData format
+  server-side, this client just never requests one.
+- Inherits org-ietf-turn's own disclosed scope limits (IPv4-only,
+  ephemeral-short-term-credential-only, no quotas/DoS limits) by
+  construction.
+
+### `deps.edn`
+
+```clojure
+io.github.kotoba-lang/org-ietf-turn {:local/root "../org-ietf-turn"}
+```
+
+(added alongside this repo's existing `io.github.kotoba-lang/*` sibling
+`:local/root` entries — `kotoba.dtn.transport.turn-relay` requires
+`kotoba.turn.stun` / `kotoba.turn.demux`, and `kotoba.dtn.transport.udp`
+additionally requires `kotoba.turn.credential` and
+`kotoba.turn.listener`'s sibling repo checked out alongside this one, same
+pattern `phone`/`html`/`css`/`wire`/`io-libp2p` already establish.)
+
+### E2E demo (`test/kotoba/dtn/transport/udp_turn_demo.cljs`)
+
+An executable proof, not a unit test — run it and read the output. This is
+the most complex integration in this whole repo: three protocol layers for
+real (dtn bundles, a real TURN relay, real UDP socket timing). Requires
+`kotoba-lang/phone`, `/html`, `/css`, `/wire`, `/bytes`, and
+`org-ietf-turn` checked out as siblings:
+
+```bash
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
+  test/kotoba/dtn/transport/udp_turn_demo.cljs
+```
+
+Three scenarios, printing `PASS`/`FAIL` per scenario and a final
+`RESULT: N/3 scenarios passed` line (exit 0 iff 3/3):
+
+1. **Baseline** — two dtn nodes, NEITHER behind NAT (no `:turn-relay`
+   config on either), exchange a real message directly over
+   `node:dgram` sockets. Proves the new UDP transport itself works before
+   TURN enters the picture at all.
+2. **The actual NAT-traversal proof** — a real `kotoba.turn.listener` is
+   started with a known shared secret. Node A is `:turn-relay`-configured,
+   with node B's real address as A's one permitted peer. Node B has NO
+   TURN config (B is the directly-reachable one) and is deliberately
+   configured to reach A ONLY at A's TURN-allocated relayed address —
+   never A's real bound port, simulating "A is unreachable directly, B can
+   only reach A through the relay." B sends to A (addressed to A's relay
+   address); the demo confirms A's `:inbox` actually receives it, arrived
+   via the relay and unwrapped from a real STUN Data indication. A then
+   replies to B (sent by A as a real STUN Send indication through the SAME
+   relay — A has zero direct-send path in this scoped design); the demo
+   confirms B's `:inbox` actually receives A's reply. Genuine
+   bidirectionality is proven, not just one direction.
+3. **Honesty check** — not a simulated firewall (nothing to literally
+   block on loopback), but a mechanical confirmation, against the EXACT
+   live node B instance scenario 2 just used (not a fresh unrelated one),
+   that B's own config contains A's real port NOWHERE at all — walking the
+   entire node-handle map, not just the one `:peers` key this demo happens
+   to know to check. Proves scenario 2's success is not an accidental
+   direct-connection fallback dressed up as a relay proof.
 
 ## License
 
