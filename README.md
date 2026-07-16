@@ -30,7 +30,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 147 assertions, all green (`clojure -M:test`, pure `.cljc` only) |
+| Tests | 175 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence`, see below) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
@@ -39,7 +39,9 @@ across JVM / ClojureScript / SCI / GraalVM.
 | Bundle integrity (`:peer-secrets`) | yes — pre-shared-secret HMAC-SHA256, tamper-evidence + origin check; NOT a PKI, NOT TLS, see below |
 | Replay protection (`:dtn/sequence-number` high-water mark) | yes — per-source monotonic sequence tracking, layered on `:peer-secrets`; **only applies to authenticated peers**; high-water marks persist to disk when `:replay-state-path` is configured (in-memory only, resets on restart, otherwise), see below |
 | Multi-hop relay routing (`:routes`) | yes — static/pre-configured single-hop relay via a caller-supplied next-hop table (`router/route-decision`'s `:relay` action), hop-count/`max-hops` loop prevention; NOT automatic route discovery/advertisement, NOT full Contact Graph Routing (RFC 9174), see below |
+| Peer discovery (`kotoba.dtn.discovery`, real I/O) | yes — gossip-based presence broadcast/discovery built directly on [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)'s real gossip transport; E2E demo green (3/3 scenarios); NOT a DHT, NOT authenticated (a presence announcement is trusted at face value), polling-based (not push/callback), see below |
 | Mesh-radio / satellite transport | no (no hardware in scope; routing logic only, see demo scenario 3) |
+| NAT traversal | no — explicitly deferred to a future `kotoba-lang/org-ietf-turn` phase; TURN is UDP-based and this repo's transport is TCP-based, a materially different, larger problem than gossip-based discovery |
 
 ## Contract
 
@@ -152,9 +154,11 @@ logic, and its own ad-hoc outbound socket pool — none of it actually
 DTN-specific. That generic "move EDN maps over a TCP byte stream"
 plumbing has been extracted into `kotoba-lang/wire` (built on
 [`kotoba-lang/bytes`](https://github.com/kotoba-lang/bytes)'s portable
-byte-vector primitives), so `kotoba-lang/turn`'s future relay I/O and
-`kotoba-lang/net`'s future gossip I/O can share it too instead of
-re-implementing the same mechanics. This namespace now calls
+byte-vector primitives), so `kotoba-lang/turn`'s future relay I/O could
+share it too instead of re-implementing the same mechanics —
+[`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)'s real
+gossip I/O already does (see "Peer discovery" below: this repo's own
+`kotoba.dtn.discovery` is a direct consumer of it). This namespace now calls
 `kotoba.wire.tcp/start-server!` / `connect-or-reuse!` / `send-framed!` /
 `close-all!` for the actual socket I/O. The wire FORMAT itself is
 unchanged (still a 4-byte big-endian length prefix + UTF-8 `pr-str`'d EDN
@@ -164,13 +168,20 @@ DTN-specific behavior (store-and-forward, relay, auth, replay checking)
 is untouched; only the low-level "how do bytes get framed and pushed down
 a socket" mechanics moved out.
 
-**Scope.** Direct internet-overlay transport only: a peer's host:port must
-already be known (passed to `start-node!` as `:peers`). No discovery, no
-NAT traversal, no gossip routing — that composition, via
-[`kotoba-lang/net`](https://github.com/kotoba-lang/net) (gossip) and
-[`kotoba-lang/turn`](https://github.com/kotoba-lang/turn) (relay), is
-explicitly future work, same as this repo's original transport-deferral
-ADR. Mesh-radio and satellite transports are **not implemented** — no such
+**Scope.** This namespace, in isolation, is still direct internet-overlay
+transport only: a peer's host:port must already be known (passed to
+`start-node!` as `:peers`) — `kotoba.dtn.transport.tcp` itself never
+learns, advertises, or gossips a peer's address on its own. **The
+discovery gap this used to name as future work is now closed, at the
+`kotoba.dtn.discovery` layer, not here**: that namespace announces a
+node's own reachability over, and consumes peer announcements from, a
+real [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)
+gossip mesh, and populates a *running* node handle's `:peers` (this exact
+option) dynamically — see "Peer discovery" below. NAT traversal (via a
+future `kotoba-lang/org-ietf-turn` relay) remains explicitly future work —
+TURN is UDP-based and this transport is TCP-based, bridging them is a
+materially different, larger problem than gossip-based discovery.
+Mesh-radio and satellite transports are **not implemented** — no such
 hardware exists in this dev environment — but `kotoba.dtn.router`'s
 priority ordering over transport kinds is still real and tested against a
 simulated mesh-radio link (see the demo below, scenario 3).
@@ -371,10 +382,15 @@ nodes, and no dynamic topology learning** here. This is NOT full Contact
 Graph Routing (CGR, RFC 9174) and NOT epidemic/PRoPHET-style multi-hop
 relay — it's "single-hop-relay-via-a-configured-next-hop", one step
 beyond the prior direct-neighbor-or-store heuristic, not a general
-multi-hop routing protocol. Automatic route discovery/advertisement
-remains explicitly future work, same as the discovery/NAT-traversal/gossip
-composition (`kotoba-lang/net`, `kotoba-lang/turn`) already deferred
-above.
+multi-hop routing protocol. Automatic ROUTE discovery/advertisement (a
+node learning/gossiping *multi-hop routing tables* — who can reach whom
+via whom, CGR-style) remains explicitly future work. Do not confuse this
+with PEER discovery (a node learning a *direct* neighbor's host:port),
+which `kotoba.dtn.discovery` (see "Peer discovery" below) now closes —
+that's a materially smaller problem (flat gossip presence broadcast, no
+routing-table computation) than the route-advertisement gap named here.
+NAT traversal (via a future `kotoba-lang/org-ietf-turn` relay) also
+remains deferred, same as before.
 
 **Loop prevention (`:dtn/hop-count`, `max-hops`).** Rather than adding a
 `:dtn/hop-count` field to `kotoba.dtn/bundle`'s pure constructor, hop
@@ -498,6 +514,177 @@ Seven scenarios, printing `PASS`/`FAIL` per scenario and a final
    `send-message!` call) from A to B and confirms THAT one is accepted
    normally — proving replay rejection doesn't wrongly block legitimate
    subsequent traffic from the same authenticated source.
+
+## Peer discovery (`kotoba.dtn.discovery`, real I/O)
+
+Everything in "Internet-overlay transport" above still requires a peer's
+host:port to already be known via `:peers` — this namespace
+(`src/kotoba/dtn/discovery.cljs`) closes that gap: dtn nodes **announce**
+their own reachability over, and **consume** presence announcements from,
+a real [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)
+gossip mesh, populating a *running* node handle's `:peers` map
+dynamically. Two dtn nodes that were never told about each other's
+host:port in advance can exchange a real bundle over
+`kotoba.dtn.transport.tcp` purely because gossip-based discovery told them
+how to reach each other — see the E2E demo below for the actual proof.
+
+**This is a real, direct dependency on `kotoba-lang/io-libp2p`** — unlike
+this repo's deliberately duck-typed, dependency-free relationship to
+`kotoba-lang/rcs` (see `kotoba.dtn.gateway`), `io-libp2p` already exists,
+is independently stable and versioned, and there's no build-order reason
+to avoid depending on it directly here. `deps.edn` gained a
+`io.github.kotoba-lang/io-libp2p {:local/root "../io-libp2p"}` entry to
+match (this repo now expects `kotoba-lang/io-libp2p` checked out as a
+sibling, alongside `phone`/`html`/`css`/`wire`/`bytes`).
+
+**Contract.**
+
+```clojure
+(require '[kotoba.dtn.transport.tcp :as tcp])
+(require '[kotoba.net.transport.tcp :as net-tcp])
+(require '[kotoba.dtn.discovery :as discovery])
+
+;; Two dtn nodes, both started with EMPTY :peers — genuinely no static
+;; config — plus a gossip node each, mesh-connected via io-libp2p.
+(def dtn-a (tcp/start-node! {:e164 "+819012345678" :port 5100 :peers {}}))
+(def dtn-b (tcp/start-node! {:e164 "+818098765432" :port 5101 :peers {}}))
+(def gossip-a (net-tcp/start-node!
+               {:node-id "a" :port 5110
+                :peers {"b" {:host "127.0.0.1" :port 5111 :topics #{"dtn-presence"}}}}))
+(def gossip-b (net-tcp/start-node!
+               {:node-id "b" :port 5111
+                :peers {"a" {:host "127.0.0.1" :port 5110 :topics #{"dtn-presence"}}}}))
+
+;; Wire each dtn node to its own gossip node.
+(def handles
+  [(discovery/start-announcing! dtn-a gossip-a :advertise-host "127.0.0.1")
+   (discovery/start-discovering! dtn-a gossip-a)
+   (discovery/start-announcing! dtn-b gossip-b :advertise-host "127.0.0.1")
+   (discovery/start-discovering! dtn-b gossip-b)])
+
+;; ... after at least one discovery poll cycle, dtn-a's :peers now
+;; genuinely contains a live entry for B, populated purely by gossip:
+(:peers @dtn-a)  ;; => {"+818098765432" {:host "127.0.0.1" :port 5101}}
+
+(discovery/stop-discovery! handles)
+```
+
+**Scope — explicitly NOT:**
+
+- **A DHT.** No distributed routing table, no key-based lookup — just a
+  flat gossip broadcast of "here is how to reach me" on a well-known
+  topic (`"dtn-presence"` by default), consumed by every dtn node polling
+  that topic on the same gossip mesh.
+- **Authenticated.** A presence announcement is trusted at face value —
+  this module does not sign or verify who actually sent it, only
+  structurally validates its shape
+  (`kotoba.dtn.discovery.presence/valid-presence-announcement?`).
+  Combining a newly-discovered peer with `kotoba.dtn.auth`'s
+  `:peer-secrets` for the *actual bundle traffic* once it's discovered —
+  so a forged discovery announcement can, at worst, get itself added as
+  an unauthenticated `:peers` entry, never impersonate an already-
+  authenticated peer without also holding that peer's real shared secret
+  — is the **caller's job**. This module never configures
+  `:peer-secrets` on anyone's behalf.
+- **Push/callback-based.** `kotoba-lang/io-libp2p`'s transport currently
+  exposes no inbound-message callback/hook for an external consumer — its
+  only observable integration surface is the plain `:received-messages`
+  vector on its own node handle atom. Rather than modify `io-libp2p` to
+  add a push hook (out of scope — `io-libp2p` is treated here as a
+  stable, already-built dependency to consume, not extend), this
+  namespace **polls** that vector on a plain `js/setInterval`, the same
+  mechanism `start-announcing!` already uses for its own periodic
+  broadcast. A deliberate simplicity choice given `io-libp2p`'s current
+  observable-state-only integration surface, not an oversight — and
+  exactly why `io-libp2p` itself never needed to change for this to work.
+
+**A real gap discovered while wiring this up (not an `io-libp2p` bug —
+accommodated entirely in the shape of the data this module broadcasts).**
+`kotoba.net.gossip/route-message`'s dedup is purely content-hash based: a
+locally-originated `publish!` marks its own payload's hash `seen` on the
+*publishing* node's own seen-cache the moment it's first sent. If a
+periodic presence re-announcement carried the exact same
+`{:dtn/e164 :dtn/host :dtn/port :dtn/transport-kind}` map on every tick,
+every re-announcement after the very first would hash identically to the
+first, `route-message` would treat it as already-seen, and `publish!`
+would silently stop writing to any peer's socket at all after tick one —
+which would have broken exactly the "late-joining node discovers
+existing peers" case (see the E2E demo, scenario 3): a peer that joins
+the gossip mesh *after* that one-and-only successful broadcast would
+never receive a copy. `kotoba.dtn.discovery.presence/presence-announcement`
+therefore stamps a real wall-clock `:dtn/announce-ts` (via `js/Date.now()`,
+from the one layer — `kotoba.dtn.discovery`'s impure `announce!` — that
+actually has a clock, the same seam `kotoba.dtn.transport.tcp/send-message!`
+already uses) onto every announcement, so every tick's payload hashes
+distinctly and `route-message` never short-circuits a re-announcement as
+an already-seen duplicate. See `kotoba.dtn.discovery.presence`'s namespace
+docstring for the full writeup — this is the same *kind* of external
+workaround `kotoba.net.transport.tcp`'s own `safe-from` already is for a
+different `kotoba.net.gossip` landmine, just discovered independently
+while building this module, not a change to `gossip.cljc` itself.
+
+**Pure helpers** (announcement shape construction/validation,
+self-announcement detection, translating an announcement into the
+`{:host .. :port ..}` shape `:peers` already expects, and the
+`:received-messages` dedup-index math) live in
+`kotoba.dtn.discovery.presence` — portable `.cljc`, covered by
+`clojure -M:test` (see Maturity table above: 28 of this repo's 175 total
+assertions). `kotoba.dtn.discovery` itself is `.cljs`-only (real socket
+I/O via `io-libp2p`, real `js/setInterval`) and, like
+`kotoba.dtn.transport.tcp`, is never loaded by the JVM `clojure -M:test`
+suite.
+
+### E2E demo (`test/kotoba/dtn/discovery_demo.cljs`)
+
+An executable proof, not a unit test — run it and read the output:
+
+```bash
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
+  test/kotoba/dtn/discovery_demo.cljs
+```
+
+(the `../io-libp2p/src` classpath entry, beyond what the transport demo
+above needs, is required because `kotoba.dtn.discovery` depends directly
+on `kotoba.net.transport.tcp`.)
+
+Three scenarios, printing `PASS`/`FAIL` per scenario and a final
+`RESULT: N/3 scenarios passed` line (exit 0 iff 3/3):
+
+1. **Zero-static-config discovery, then a real dtn message delivery
+   purely from discovered peers.** Three dtn nodes (A, B, C) start with
+   `:peers {}` — genuinely no static config — plus three `io-libp2p`
+   gossip nodes, mesh-connected. Each dtn node is wired to its own gossip
+   node via `start-announcing!`/`start-discovering!`. The demo asserts,
+   BEFORE sending anything, that A's `:peers` went from empty (captured
+   the instant after `start-node!`, before any discovery loop even ran)
+   to genuinely containing real entries for both B and C, with the
+   correct host:port — proving discovery, not some other path, populated
+   it. A then `send-message!`s to C over real dtn TCP using that
+   discovered entry; the demo confirms delivery succeeds and lands in
+   C's `:inbox`.
+2. **Self-announcements are correctly filtered.** First confirms that a
+   normal full-mesh gossip run never puts a node's own e164 into its own
+   `:peers` — a real but *weak* proof by itself, since
+   `kotoba.net.gossip`'s own fanout already excludes `{from self}` at the
+   transport layer, so a full mesh never round-trips a node's own
+   broadcast back to it regardless of whether this module's own
+   self-filtering code does anything. The demo then closes that gap
+   non-vacuously: it directly crafts a syntactically-valid self-
+   announcement and injects it straight into a gossip node's own
+   `:received-messages` (simulating what a differently-shaped topology —
+   a longer relay chain, a ring, a misbehaving peer — genuinely could
+   deliver), and confirms `process-presence-updates!` still refuses to
+   add it.
+3. **A late-joining node discovers existing peers too, not just vice
+   versa.** A and B start first, mesh-connected, and discover each other.
+   Only then does C start — a real late join: C's own dtn and gossip
+   processes/ports do not exist yet when A/B's gossip mesh config already
+   lists C's address (matching `io-libp2p`'s own static-`:peers`-at-
+   `start-node!`-time scoping — there is no API to add a peer to an
+   already-running gossip node). The demo confirms C eventually
+   discovers BOTH pre-existing A and B, with the correct host:port —
+   proving discovery is symmetric, not just whichever order happened to
+   be tested first.
 
 ## License
 
