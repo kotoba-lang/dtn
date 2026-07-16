@@ -44,6 +44,77 @@
     (is (= {:dtn/action :store} (router/route-decision (dtn/bundle src dest {}) [])))
     (is (= {:dtn/action :store} (router/route-decision (dtn/bundle src dest {}) nil)))))
 
+(deftest route-decision-relay-test
+  (testing "a route-table entry with a reachable next-hop link produces :relay"
+    (let [b (dtn/bundle src dest {})
+          relay-eid (dtn/eid elsewhere)
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop relay-eid}]
+          decision (router/route-decision b [l-relay] :routes routes)]
+      (is (= :relay (:dtn/action decision)))
+      (is (= l-relay (:dtn/via decision)))
+      (is (= relay-eid (:dtn/next-hop decision)))))
+
+  (testing "no direct link and no routes at all still stores the bundle"
+    (let [b (dtn/bundle src dest {})]
+      (is (= {:dtn/action :store} (router/route-decision b [])))))
+
+  (testing "a routes entry whose destination doesn't match falls through to :store"
+    (let [b (dtn/bundle src dest {})
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid "+15550001111") :dtn/next-hop (dtn/eid elsewhere)}]]
+      (is (= {:dtn/action :store} (router/route-decision b [l-relay] :routes routes)))))
+
+  (testing "an unreachable next-hop falls through to :store"
+    (let [b (dtn/bundle src dest {})
+          l-relay-unreachable (link/link "L1" elsewhere :internet-overlay :reachable? false)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]]
+      (is (= {:dtn/action :store} (router/route-decision b [l-relay-unreachable] :routes routes)))))
+
+  (testing "next-hop configured in routes but no link for it at all falls through to :store"
+    (let [b (dtn/bundle src dest {})
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]]
+      (is (= {:dtn/action :store} (router/route-decision b [] :routes routes)))))
+
+  (testing "hop-count below max-hops (default 8) still relays"
+    (let [b (dtn/bundle src dest {})
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]
+          decision (router/route-decision b [l-relay] :routes routes :hop-count 7)]
+      (is (= :relay (:dtn/action decision)))))
+
+  (testing "hop-count at the default max-hops (8) falls through to :store even with a valid route"
+    (let [b (dtn/bundle src dest {})
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]
+          decision (router/route-decision b [l-relay] :routes routes :hop-count 8)]
+      (is (= {:dtn/action :store} decision))))
+
+  (testing "hop-count over the default max-hops falls through to :store"
+    (let [b (dtn/bundle src dest {})
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]
+          decision (router/route-decision b [l-relay] :routes routes :hop-count 20)]
+      (is (= {:dtn/action :store} decision))))
+
+  (testing "an overridable :max-hops is honored"
+    (let [b (dtn/bundle src dest {})
+          l-relay (link/link "L1" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]]
+      (is (= :relay (:dtn/action (router/route-decision b [l-relay] :routes routes
+                                                          :hop-count 2 :max-hops 3))))
+      (is (= {:dtn/action :store} (router/route-decision b [l-relay] :routes routes
+                                                           :hop-count 3 :max-hops 3)))))
+
+  (testing "a direct reachable link always wins over a configured relay route"
+    (let [b (dtn/bundle src dest {})
+          l-direct (link/link "L1" dest :internet-overlay :reachable? true)
+          l-relay  (link/link "L2" elsewhere :internet-overlay :reachable? true)
+          routes [{:dtn/destination (dtn/eid dest) :dtn/next-hop (dtn/eid elsewhere)}]
+          decision (router/route-decision b [l-direct l-relay] :routes routes)]
+      (is (= :forward (:dtn/action decision)))
+      (is (= l-direct (:dtn/via decision))))))
+
 (deftest expire-store-test
   (testing "drops expired bundles while keeping live ones"
     (let [live    (dtn/bundle src dest {} :creation-ts 1000 :lifetime-ms 5000)

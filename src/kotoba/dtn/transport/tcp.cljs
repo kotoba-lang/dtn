@@ -11,8 +11,8 @@
   .cljs, NOT .cljc: it requires real `node:net` socket I/O, so it only
   runs under a Node.js-hosted ClojureScript runtime (nbb in this repo).
   The JVM `clojure -M:test` suite does not — and cannot — load `.cljs`
-  files, so this namespace can never regress the existing 84-assertion
-  pure test suite.
+  files, so this namespace can never regress the existing pure `.cljc`
+  test suite (see this repo's README for the current assertion count).
 
   SCOPE — direct internet-overlay transport only: a peer's IP:host and
   port must already be known (passed in via `:peers` to `start-node!`).
@@ -39,14 +39,28 @@
   used here since it round-trips this repo's `:dtn/*` / `:rcs/*`
   namespaced-keyword maps identically and is the more portable idiom).
 
-  Two optional `start-node!` options close real gaps in this transport:
+  Three optional `start-node!` options close real gaps in this transport:
   `:store-path` (see `kotoba.dtn.store`) makes the node's undelivered
   `:store` survive a process crash/restart instead of being purely
-  in-memory, and `:peer-secrets` (see `kotoba.dtn.auth`) adds pre-shared
+  in-memory, `:peer-secrets` (see `kotoba.dtn.auth`) adds pre-shared
   HMAC-SHA256 signing/verification so a receiving node can detect a
   forged or tampered bundle instead of accepting anything any TCP client
-  sends. Both are opt-in and backward compatible: omitted, this
-  namespace behaves exactly as it did before either existed."
+  sends, and `:routes` (see `kotoba.dtn.router`'s :relay action) lets a
+  node forward a bundle through a configured intermediate peer when it
+  has no direct link to the bundle's final destination — STATIC,
+  pre-configured relay only, no automatic route discovery/advertisement.
+  All three are opt-in and backward compatible: omitted, this namespace
+  behaves exactly as it did before any of them existed.
+
+  Relaying also closes a related correctness gap: previously, any
+  successfully-decoded (and, when configured, signature-verified) inbound
+  bundle was accepted straight into this node's own `:inbox` regardless
+  of whether its `:dtn/destination` actually matched this node's own EID
+  — harmless while every message happened to be sent directly to its
+  intended recipient, but wrong once relaying exists. `handle-inbound-bundle!`
+  now checks that match: a bundle addressed to someone else is never
+  added to `:inbox` here — it's re-routed via the same `route-and-send!`
+  this node uses for its own locally-originated sends (see below)."
   (:require ["node:net" :as net]
             [clojure.edn :as edn]
             [promesa.core :as p]
@@ -56,6 +70,13 @@
             [kotoba.dtn.gateway :as gateway]
             [kotoba.dtn.auth :as auth]
             [kotoba.dtn.store :as store]))
+
+;; Forward declarations: handle-inbound-bundle! (below) needs to call
+;; route-and-send! (defined further down, after the outbound-send
+;; machinery it depends on) and links-for (defined further down too, next
+;; to the other :peers-derived helpers) when it recognizes a relay case —
+;; a bundle whose :dtn/destination doesn't match this node's own EID.
+(declare route-and-send! links-for)
 
 ;; ---------------------------------------------------------------------------
 ;; Wire framing — 4-byte big-endian length prefix + UTF-8 pr-str EDN payload
@@ -134,14 +155,42 @@
   — never added to :inbox, and never added to :store/retried (it isn't a
   legitimate delivery to retry-later, it's a security event). Otherwise
   drops expired bundles (RFC 9171 retention constraint elapsed).
-  Otherwise tries to shape the payload as an RCS-shaped or SMS-shaped
-  message (kotoba.dtn.gateway) purely for demo/operator visibility, and
-  appends {:message <decoded-or-nil> :bundle bundle} onto the node's
-  :inbox so an operator (or this repo's E2E demo) can observe what
-  actually arrived."
+
+  Otherwise checks whether bundle's :dtn/destination actually matches
+  this node's own EID:
+
+  - MATCH (this bundle really is addressed to this node): the original
+    behavior — tries to shape the payload as an RCS-shaped or SMS-shaped
+    message (kotoba.dtn.gateway) purely for demo/operator visibility, and
+    appends {:message <decoded-or-nil> :bundle bundle} onto the node's
+    :inbox so an operator (or this repo's E2E demo) can observe what
+    actually arrived. Logs DTN-RECV.
+
+  - MISMATCH (this node is only an intermediate relay hop for this
+    bundle): the bundle is NEVER added to :inbox — it isn't this node's
+    message. Its :dtn/hop-count is incremented (missing/nil treated as
+    0) and it's handed to route-and-send! again — the SAME function this
+    node uses for its own locally-originated sends — using this node's
+    OWN :peers-derived links and configured :routes, so it either
+    forwards/relays onward for real or falls back to this node's own
+    :store if it, too, has no path to the destination right now. Logs
+    DTN-RELAY (distinct from DTN-RECV) including a preview of the routing
+    decision (`via`) computed from the exact same pure
+    kotoba.dtn.router/route-decision call route-and-send! is about to
+    make — not a fabricated/out-of-band log line.
+
+    A lightweight, node-local :seen-bundle-ids set (NOT full DTN
+    routing-loop detection, no cross-node coordination — see
+    kotoba.dtn.router's docstring for the honest scope of the hop-count
+    guard this complements) suppresses re-relaying the exact same
+    :dtn/bundle-id twice through this node, so a bundle that somehow
+    loops back to a node it already passed through doesn't get
+    re-forwarded a second time by that node."
   [node-handle-atom bundle]
   (let [now-ms   (js/Date.now)
-        expired? (dtn/expired? bundle now-ms)]
+        expired? (dtn/expired? bundle now-ms)
+        own-eid  (dtn/eid (:e164 (deref node-handle-atom)))
+        mismatch? (not= (:dtn/destination bundle) own-eid)]
     (cond
       (not (verified? (deref node-handle-atom) bundle))
       (log! node-handle-atom "tcp: REJECTED inbound bundle claiming source=" (:dtn/source bundle)
@@ -150,6 +199,25 @@
 
       expired?
       (log! node-handle-atom "tcp: dropping expired inbound bundle " (:dtn/bundle-id bundle))
+
+      (and mismatch? (contains? (:seen-bundle-ids (deref node-handle-atom)) (:dtn/bundle-id bundle)))
+      (log! node-handle-atom "tcp: dropping duplicate relay of already-seen bundle "
+            (:dtn/bundle-id bundle) " (seen-bundle-id suppression, not full loop detection)")
+
+      mismatch?
+      (let [relay-bundle (update bundle :dtn/hop-count (fnil inc 0))]
+        (swap! node-handle-atom update :seen-bundle-ids conj (:dtn/bundle-id bundle))
+        (let [{:keys [routes] :as node-handle} (deref node-handle-atom)
+              preview (router/route-decision relay-bundle (links-for node-handle)
+                                              :routes routes
+                                              :hop-count (:dtn/hop-count relay-bundle))
+              via-eid (get-in preview [:dtn/via :dtn/neighbor])]
+          (log! node-handle-atom "DTN-RELAY from=" (:dtn/source bundle)
+                " to=" (:dtn/destination bundle)
+                " via=" (or via-eid (name (:dtn/action preview)))
+                " hop-count=" (:dtn/hop-count relay-bundle)
+                " (not addressed to this node — relaying onward, not added to :inbox)")
+          (route-and-send! node-handle-atom relay-bundle)))
 
       :else
       (let [decoded (or (gateway/bundle->rcs-shaped bundle)
@@ -172,14 +240,17 @@
          :port <TCP port to bind>
          :peers {e164 {:host \"...\" :port N} ...}   ; known peers, optional
          :store-path <path>                          ; optional, see below
-         :peer-secrets {e164 secret-string ...}}      ; optional, see below
+         :peer-secrets {e164 secret-string ...}       ; optional, see below
+         :routes [{:dtn/destination eid :dtn/next-hop eid} ...]}  ; optional, see below
 
   Returns an atom (the 'node handle') holding:
     {:e164 e164 :port port :peers peers
      :store-path store-path  ; nil unless configured — see below
      :peer-secrets {...}     ; {} unless configured — see below
+     :routes [...]           ; [] unless configured — see below
      :store []      ; bundles not yet delivered (store-and-forward)
      :inbox []      ; {:message ... :bundle ...} this node has received
+     :seen-bundle-ids #{}    ; :dtn/bundle-ids this node has already relayed
      :server <net/Server>
      :sockets {}}   ; e164 -> open outbound net.Socket, lazily connected
 
@@ -208,13 +279,28 @@
   for a given peer (the common case, and the ONLY case for every
   existing caller), send/receive for that peer is identical to before
   this option existed — no auth is performed, nothing is required or
-  rejected."
-  [{:keys [e164 port peers store-path peer-secrets]}]
+  rejected.
+
+  :routes (optional, see kotoba.dtn.router's :relay action) — a coll of
+  {:dtn/destination eid :dtn/next-hop eid} entries: 'to reach
+  :dtn/destination, forward to :dtn/next-hop instead'. Consulted by
+  route-and-send! (both for this node's own locally-originated sends and
+  when this node relays an inbound bundle addressed to someone else —
+  see handle-inbound-bundle!) ONLY when there's no direct link to the
+  bundle's destination. STATIC and pre-configured: this node never
+  learns, advertises, or gossips routes on its own — the caller supplies
+  the table. When omitted (the common case, and the ONLY case for every
+  existing caller before this option existed), behavior is unchanged:
+  no route table to consult, so a bundle with no direct link always
+  falls to :store, exactly as before."
+  [{:keys [e164 port peers store-path peer-secrets routes]}]
   (let [node-handle-atom (atom {:e164 e164 :port port :peers (or peers {})
                                  :store-path store-path
                                  :peer-secrets (or peer-secrets {})
+                                 :routes (or routes [])
                                  :store (if store-path (store/load-store store-path) [])
                                  :inbox []
+                                 :seen-bundle-ids #{}
                                  :server nil :sockets {} :accepted #{}})
         server (net/createServer
                 (fn [socket]
@@ -327,18 +413,35 @@
 
 (defn route-and-send!
   "Run the pure kotoba.dtn.router/route-decision against this node's
-  current links (derived from :peers), then actually act on it:
-    :forward -> attempt-forward!; on failure (the real-world case the
-                pure decision can't know about — a configured link
-                doesn't mean the peer process is actually up right now)
-                fall back to store-bundle!.
+  current links (derived from :peers) and configured :routes, then
+  actually act on it:
+    :forward / :relay -> attempt-forward! via the decision's :dtn/via
+                link — both actions write the identical wire frame to
+                the identical link; :relay is only a distinct label so
+                callers (e.g. handle-inbound-bundle!'s DTN-RELAY log)
+                can tell an intermediate hop toward a configured
+                next-hop apart from a direct final-hop delivery. On
+                failure (the real-world case the pure decision can't
+                know about — a configured link doesn't mean the peer
+                process is actually up right now) fall back to
+                store-bundle! either way.
     :store   -> store-bundle! directly.
+
+  bundle's own :dtn/hop-count (missing/nil treated as 0 — kotoba.dtn/bundle
+  itself has no such field; hop count is tracked here, at the transport
+  layer, incremented by handle-inbound-bundle! each time this node
+  relays an inbound bundle onward) is passed through to route-decision's
+  :max-hops loop-prevention guard.
+
   Always returns a Promise<boolean> — true iff the bundle was actually
   delivered over the wire just now."
   [node-handle-atom bundle]
-  (let [decision (router/route-decision bundle (links-for (deref node-handle-atom)))]
+  (let [{:keys [routes] :as node-handle} (deref node-handle-atom)
+        decision (router/route-decision bundle (links-for node-handle)
+                                         :routes routes
+                                         :hop-count (or (:dtn/hop-count bundle) 0))]
     (case (:dtn/action decision)
-      :forward
+      (:forward :relay)
       (p/let [delivered? (attempt-forward! node-handle-atom bundle (:dtn/via decision))]
         (when-not delivered?
           (store-bundle! node-handle-atom bundle))

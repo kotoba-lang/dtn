@@ -18,8 +18,11 @@ fragmentation/reassembly, or BPSec (RFC 9172) security blocks (the
 `kotoba.dtn.auth` pre-shared-secret HMAC layer described below is a
 narrower, honestly-scoped alternative used only by the TCP transport —
 not an implementation of BPSec). Routing is an honestly-scoped
-**direct-neighbor-or-store heuristic**, not full Contact Graph Routing
-(CGR, RFC 9174) or epidemic/PRoPHET multi-hop relay. Portable `.cljc`
+**direct-neighbor-or-store heuristic, plus an optional static
+single-hop relay via a caller-configured next-hop table** (`:routes`,
+see below) — not full Contact Graph Routing (CGR, RFC 9174), not
+automatic route discovery/advertisement, and not epidemic/PRoPHET
+multi-hop relay. Portable `.cljc`
 across JVM / ClojureScript / SCI / GraalVM.
 
 ## Maturity
@@ -27,13 +30,14 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 112 assertions, all green (`clojure -M:test`, pure `.cljc` only) |
+| Tests | 126 assertions, all green (`clojure -M:test`, pure `.cljc` only) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
-| Internet-overlay transport (real I/O) | yes — plain TCP via nbb, see below; E2E demo green (5/5 scenarios) |
+| Internet-overlay transport (real I/O) | yes — plain TCP via nbb, see below; E2E demo green (6/6 scenarios) |
 | Durable store (`:store-path`) | yes — disk-backed, survives process restart; not crash-atomic on the rewrite step, see below |
 | Bundle integrity (`:peer-secrets`) | yes — pre-shared-secret HMAC-SHA256, tamper-evidence + origin check; NOT a PKI, NOT TLS, NOT replay-protected, see below |
+| Multi-hop relay routing (`:routes`) | yes — static/pre-configured single-hop relay via a caller-supplied next-hop table (`router/route-decision`'s `:relay` action), hop-count/`max-hops` loop prevention; NOT automatic route discovery/advertisement, NOT full Contact Graph Routing (RFC 9174), see below |
 | Mesh-radio / satellite transport | no (no hardware in scope; routing logic only, see demo scenario 3) |
 
 ## Contract
@@ -58,6 +62,15 @@ across JVM / ClojureScript / SCI / GraalVM.
 
 ;; Resilience-first: prefer mesh/satellite over internet when it's down.
 (router/route-decision b [l] :priority [:mesh-radio :satellite :internet-overlay])
+
+;; No direct link to the destination, but a caller-configured static route
+;; through a reachable next-hop -> :relay (see "Internet-overlay transport" below).
+(def b2 (dtn/bundle "+819012345678" "+12125550199" {:body "hi"}))
+(def via-relay (link/link "L2" "+447700900123" :internet-overlay :reachable? true))
+(router/route-decision b2 [via-relay]
+                        :routes [{:dtn/destination "dtn:+12125550199"
+                                  :dtn/next-hop "dtn:+447700900123"}])
+;; => {:dtn/action :relay :dtn/via {...L2...} :dtn/next-hop "dtn:+447700900123"}
 
 (gateway/bundle->sms b)                            ; unwrap iff SMS-shaped payload
 ```
@@ -122,7 +135,7 @@ real OS processes: a plain TCP transport for the `:internet-overlay`
 Node's core `node:net` (no npm dependencies). It's `.cljs`, not `.cljc` —
 it only runs under a Node-hosted ClojureScript runtime ([`nbb`](https://github.com/babashka/nbb)
 in this repo) and is never loaded by the JVM `clojure -M:test` suite, so it
-cannot regress the 112 pure-data assertions above. (`kotoba.dtn.store` and
+cannot regress the 126 pure-data assertions above. (`kotoba.dtn.store` and
 `kotoba.dtn.auth`, below, keep the same split: their format/canonicalization
 logic is portable `.cljc` and covered by `clojure -M:test`, only the actual
 disk I/O / HMAC-vs-platform-crypto-module calls are Node-`.cljs`-specific,
@@ -233,6 +246,77 @@ HMAC-SHA256 per peer, not a PKI, not TLS**:
 An honest tamper-evidence/origin-check for a small pre-configured peer
 set — not a general Internet-security solution.
 
+**Multi-hop relay routing (`:routes`, `kotoba.dtn.router`'s `:relay`
+action).** `route-decision` previously only ever checked whether a
+bundle's destination was a *directly* reachable neighbor — if not, its
+only other option was `:store`, with no way for a message to travel
+through an intermediate node when no direct link to the final
+destination existed. `start-node!` now accepts an optional `:routes`
+coll (entries shaped `{:dtn/destination eid :dtn/next-hop eid}` — "to
+reach `:dtn/destination`, forward to `:dtn/next-hop` instead"),
+consulted only when there's no direct link to the bundle's destination:
+
+- If a `routes` entry matches the destination AND a link to that entry's
+  next-hop is currently reachable, `route-decision` returns
+  `{:dtn/action :relay :dtn/via <link> :dtn/next-hop <eid>}` — a
+  distinct action from `:forward` (a relay hop forwards the bundle one
+  step closer via a configured intermediate, not a final-hop delivery)
+  even though the actual socket write is identical either way. `:routes`
+  is consulted by `route-and-send!` for both this node's own
+  locally-originated sends and when this node relays an inbound bundle
+  addressed to someone else (below).
+- If no route entry matches, or the matched next-hop isn't currently
+  reachable, behavior is unchanged: falls through to `:store`.
+
+**Scope: STATIC, pre-configured relay only.** `:routes` is a table the
+caller supplies (e.g. a node operator's own config) — there is **no
+automatic route discovery, no route advertisement/gossip between
+nodes, and no dynamic topology learning** here. This is NOT full Contact
+Graph Routing (CGR, RFC 9174) and NOT epidemic/PRoPHET-style multi-hop
+relay — it's "single-hop-relay-via-a-configured-next-hop", one step
+beyond the prior direct-neighbor-or-store heuristic, not a general
+multi-hop routing protocol. Automatic route discovery/advertisement
+remains explicitly future work, same as the discovery/NAT-traversal/gossip
+composition (`kotoba-lang/net`, `kotoba-lang/turn`) already deferred
+above.
+
+**Loop prevention (`:dtn/hop-count`, `max-hops`).** Rather than adding a
+`:dtn/hop-count` field to `kotoba.dtn/bundle`'s pure constructor, hop
+count is tracked here, at the transport layer: a bundle's `:dtn/hop-count`
+(missing/nil treated as 0) is incremented by `handle-inbound-bundle!`
+each time this node relays an inbound bundle onward, and passed through
+to `route-decision`'s `:hop-count`/`:max-hops` (default
+`router/default-max-hops`, currently 8) guard — once hop-count reaches
+`max-hops`, `route-decision` refuses to return `:relay` regardless of
+`routes`, falling through to `:store` instead, so a bundle that's hopped
+too many times without reaching its destination gets held, not endlessly
+bounced. This is a simple, honest loop-prevention heuristic — **NOT**
+proper DTN routing-loop detection (no per-node "seen this bundle-id
+before" dedup is required for it). As a light additional safeguard, each
+node also keeps its own `:seen-bundle-ids` set and will not re-relay the
+exact same `:dtn/bundle-id` through itself twice — again, node-local
+suppression, not cross-node loop detection.
+
+**The destination-mismatch fix.** Before relaying existed, the TCP
+transport's inbound handler accepted ANY successfully-decoded (and, when
+configured, signature-verified) bundle straight into its own `:inbox`,
+regardless of whether the bundle's `:dtn/destination` actually matched
+the receiving node's own EID — harmless while every message happened to
+be sent directly to its intended recipient (the only usage pattern before
+relaying), but wrong once relaying exists: a relay node receiving a
+bundle addressed to someone else must not silently absorb it. This is
+fixed: `handle-inbound-bundle!` now checks that match. On a match,
+behavior is unchanged (added to `:inbox`, `DTN-RECV` logged). On a
+mismatch, the bundle is never added to `:inbox` — it's re-routed through
+this node's own `route-and-send!` (the same function used for this
+node's own locally-originated sends), so it either forwards/relays
+onward for real, or falls back to this node's own `:store` if it, too,
+has no path right now. This case is logged distinctly as `DTN-RELAY`
+(vs. the existing `DTN-RECV`) so logs make the difference legible. See
+the E2E demo's scenario 5, below, for a real 3-node A→B→C proof over
+actual TCP sockets, including confirmation that the intermediate relay
+node's own `:inbox` never absorbs the message.
+
 ### CLI (`bin/dtn_node.cljs`)
 
 A minimal demo/dev tool — no config file, no systemd, no TLS:
@@ -261,8 +345,8 @@ nbb --classpath "src:../phone/src:../html/src:../css/src" \
   test/kotoba/dtn/transport/tcp_demo.cljs
 ```
 
-Five scenarios, printing `PASS`/`FAIL` per scenario and a final
-`RESULT: N/5 scenarios passed` line (exit 0 iff 5/5):
+Six scenarios, printing `PASS`/`FAIL` per scenario and a final
+`RESULT: N/6 scenarios passed` line (exit 0 iff 6/6):
 
 1. **Real cross-process delivery** — spawns a real second `nbb` OS process
    running `bin/dtn_node.cljs listen`, sends to its real bound port, and
@@ -290,6 +374,17 @@ Five scenarios, printing `PASS`/`FAIL` per scenario and a final
    `send-message!`'s normal signing path entirely) and the demo confirms
    it does NOT appear in the receiving node's `:inbox` — rejected, with a
    logged `tcp: REJECTED inbound bundle ...` line.
+6. **Static multi-hop relay routing (real TCP, 3 nodes)** — node A is
+   configured with NO direct peer/link entry for node C at all, only for
+   node B, plus a `:routes` entry saying "to reach C, go via B"; node B
+   has a genuine direct peer entry for C. A sends a message to C over
+   real TCP. The demo confirms the message does NOT appear via any
+   nonexistent A→C link (there isn't one), that it actually flows
+   A→B→C (C's `:inbox` receives it for real), that B's `:inbox` does
+   **NOT** contain it (B correctly relayed rather than absorbing it —
+   directly proving the destination-mismatch fix above), and that B's
+   relay was a real routing decision — not an out-of-band cheat — by
+   capturing B's own `DTN-RELAY from=... to=... via=...` log line.
 
 ## License
 

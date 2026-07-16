@@ -23,8 +23,19 @@
 ;; bundle forged with the wrong secret sent directly over a raw socket
 ;; (bypassing send-message!'s normal signing path entirely).
 ;;
-;; Prints PASS/FAIL per scenario, a final "RESULT: N/5 scenarios passed"
-;; line, and exits 0 iff all 5 passed (else 1).
+;; Scenario 5 (added alongside this repo's static multi-hop relay
+;; routing) proves an A -> B -> C relay actually happens over real TCP,
+;; not just at the pure kotoba.dtn.router/route-decision level: node A
+;; has NO direct link/peer entry for node C at all, only a configured
+;; :routes entry saying 'reach C via B', and node B has a genuine direct
+;; link to C. It confirms the message actually flows A -> B -> C (C's
+;; :inbox gets it for real), that B does NOT silently absorb a bundle
+;; addressed to someone else into its own :inbox (the destination-mismatch
+;; fix), and that B's relay was a real routing decision (not an
+;; out-of-band cheat) by capturing B's own DTN-RELAY log line.
+;;
+;; Prints PASS/FAIL per scenario, a final "RESULT: N/6 scenarios passed"
+;; line, and exits 0 iff all 6 passed (else 1).
 
 (ns kotoba.dtn.transport.tcp-demo
   (:require ["node:child_process" :as cp]
@@ -275,6 +286,66 @@
                 pass?))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Scenario 5 — static multi-hop relay routing, real TCP (A -[relay]-> B -[forward]-> C)
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-5 []
+  (println "\n--- Scenario 5: static multi-hop relay routing, real TCP (A -[relay via B]-> B -[forward]-> C) ---")
+  (let [a-e164 "+819012345678" a-port 5501
+        b-e164 "+818098765432" b-port 5502
+        c-e164 "+447700900123" c-port 5503
+        ;; Capture this process's own console output (this scenario runs
+        ;; all three nodes in-process, unlike scenario 1's spawned child)
+        ;; so we can prove B's relay decision was real by finding its own
+        ;; DTN-RELAY log line — not an out-of-band cheat, just observing
+        ;; the same log! calls handle-inbound-bundle! makes for real.
+        orig-console-log (.-log js/console)
+        captured-lines (atom [])]
+    (set! (.-log js/console)
+          (fn [& args]
+            (swap! captured-lines conj (apply str args))
+            (apply orig-console-log args)))
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      ;; A has a direct peer entry for B only —
+                                      ;; deliberately NO peer/link entry for C at all.
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      ;; ...but DOES have a static configured route:
+                                      ;; "to reach C, go via B".
+                                      :routes [{:dtn/destination (dtn/eid c-e164)
+                                                :dtn/next-hop (dtn/eid b-e164)}]})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port
+                                      ;; B genuinely CAN reach C directly.
+                                      :peers {c-e164 {:host "127.0.0.1" :port c-port}}})
+            node-c (tcp/start-node! {:e164 c-e164 :port c-port :peers {}})
+            delivered? (tcp/send-message! node-a c-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to c-e164
+                                            :rcs/body "relay-scenario-check"
+                                            :rcs/content-type "text/plain"})
+            _ (sleep-ms 500)] ;; let B's relay hop (B -> C) actually land
+      (set! (.-log js/console) orig-console-log)
+      (let [log-output (str/join "\n" @captured-lines)
+            c-arrived? (boolean (some #(= "relay-scenario-check" (get-in % [:message :rcs/body]))
+                                       (:inbox (deref node-c))))
+            b-not-absorbed? (not (some #(= "relay-scenario-check" (get-in % [:message :rcs/body]))
+                                        (:inbox (deref node-b))))
+            b-relay-logged? (and (str/includes? log-output (str "[" b-e164 "] DTN-RELAY"))
+                                  (str/includes? log-output (str "to=" (dtn/eid c-e164))))]
+        (println "  A's :peers has NO entry for C at all — only for B — plus a :routes entry (C -> via B)")
+        (println "  send-message! (A -> C) returned delivered?=" delivered? "(A's wire write to next-hop B)")
+        (println "  C's :inbox actually contains the relayed message?" c-arrived?)
+        (println "  B's :inbox does NOT contain it (correctly relayed, not absorbed as its own)?" b-not-absorbed?)
+        (println "  B logged its own DTN-RELAY line for this bundle (real routing decision, not a cheat)?"
+                  (boolean b-relay-logged?))
+        (doseq [line (str/split-lines log-output)]
+          (when (str/includes? line "DTN-RELAY") (println "   >" line)))
+        (let [pass? (and (boolean delivered?) c-arrived? b-not-absorbed? (boolean b-relay-logged?))]
+          (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b) _ (tcp/stop-node! node-c)]
+            (println (if pass? "PASS" "FAIL")
+                      " scenario 5: static relay routing — A relays via B (router :relay action), B forwards on to C, B's own :inbox untouched")
+            pass?))))))
+
+;; ---------------------------------------------------------------------------
 ;; Driver
 ;; ---------------------------------------------------------------------------
 
@@ -282,11 +353,12 @@
             r2  (scenario-2)
             r3  (scenario-3)
             r4a (scenario-4a)
-            r4b (scenario-4b)]
-      (let [results [r1 r2 r3 r4a r4b]
+            r4b (scenario-4b)
+            r5  (scenario-5)]
+      (let [results [r1 r2 r3 r4a r4b r5]
             passed (count (filter true? results))]
-        (println (str "\nRESULT: " passed "/5 scenarios passed"))
-        (js/process.exit (if (= passed 5) 0 1))))
+        (println (str "\nRESULT: " passed "/6 scenarios passed"))
+        (js/process.exit (if (= passed 6) 0 1))))
     (.catch (fn [e]
               (println "DEMO CRASHED:" e)
               (js/process.exit 1))))
