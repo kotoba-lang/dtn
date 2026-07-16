@@ -49,6 +49,55 @@
     (testing "FINGERPRINT verifies"
       (is (true? (stun/verify-fingerprint req))))))
 
+(deftest build-refresh-request-test
+  (let [{:keys [username credential]} (cred/mint-credential shared-secret "erin" 600 1700000000)]
+    (testing "no lifetime-s given (2-arg): no LIFETIME attribute at all"
+      (let [req (tr/build-refresh-request username credential txid)
+            {:keys [header attrs]} (tr/parse-stun-message req)]
+        (is (= stun/refresh-request (:typ header)))
+        (is (= txid (:txid header)))
+        (is (= (b/utf8-encode username) (vec (tr/find-attr attrs stun/attr-username))))
+        (is (nil? (tr/find-attr attrs stun/attr-lifetime)))
+        (is (true? (stun/verify-message-integrity req (b/utf8-encode credential))))
+        (is (true? (stun/verify-fingerprint req)))))
+    (testing "explicit nil lifetime-s (3-arg form): same as omitting it"
+      (let [req (tr/build-refresh-request username credential txid nil)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (nil? (tr/find-attr attrs stun/attr-lifetime)))))
+    (testing "lifetime-s given: LIFETIME attribute present and round-trips via response-lifetime"
+      (let [req (tr/build-refresh-request username credential txid 4)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (= 4 (tr/response-lifetime attrs)))
+        (is (true? (stun/verify-message-integrity req (b/utf8-encode credential))))
+        (is (true? (stun/verify-fingerprint req)))))
+    (testing "lifetime-s of 0 is a valid, distinct-from-absent request (RFC 8656 §7.3 delete-allocation signal)"
+      (let [req (tr/build-refresh-request username credential txid 0)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (= 0 (tr/response-lifetime attrs)))))))
+
+(deftest response-lifetime-test
+  (testing "decodes a real Allocate-success-shaped LIFETIME attribute"
+    (let [resp (-> (stun/encode-header {:typ stun/allocate-response :length 0 :txid txid})
+                    (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr 600))
+                    stun/set-attr-length
+                    stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message resp)]
+      (is (= 600 (tr/response-lifetime attrs)))))
+  (testing "decodes a real Refresh-success-shaped LIFETIME attribute with a different value"
+    (let [resp (-> (stun/encode-header {:typ stun/refresh-response :length 0 :txid txid})
+                    (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr 4))
+                    stun/set-attr-length
+                    stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message resp)]
+      (is (= 4 (tr/response-lifetime attrs)))))
+  (testing "nil when LIFETIME is absent (e.g. an error response)"
+    (let [err-resp (-> (stun/encode-header {:typ stun/allocate-error :length 0 :txid txid})
+                        (stun/push-attr stun/attr-error-code (stun/encode-error-code 437 "Allocation Mismatch"))
+                        stun/set-attr-length
+                        stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message err-resp)]
+      (is (nil? (tr/response-lifetime attrs))))))
+
 (deftest build-send-indication-test
   (let [peer-ip [127 0 0 1] peer-port 9999
         payload (b/utf8-encode "#:dtn{:dtn/version 7}")

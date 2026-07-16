@@ -30,7 +30,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 212 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence` + 37 in `kotoba.dtn.transport.turn-relay`, see below) |
+| Tests | 226 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence` + 51 in `kotoba.dtn.transport.turn-relay` (37 original + 14 added alongside automatic TURN allocation/permission refresh, see below), see below) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
@@ -41,7 +41,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | Multi-hop relay routing (`:routes`) | yes — static/pre-configured single-hop relay via a caller-supplied next-hop table (`router/route-decision`'s `:relay` action), hop-count/`max-hops` loop prevention; NOT automatic route discovery/advertisement, NOT full Contact Graph Routing (RFC 9174), see below |
 | Peer discovery (`kotoba.dtn.discovery`, real I/O) | yes — gossip-based presence broadcast/discovery built directly on [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)'s real gossip transport; E2E demo green (3/3 scenarios); NOT a DHT, NOT authenticated (a presence announcement is trusted at face value), polling-based (not push/callback), see below |
 | Mesh-radio / satellite transport | no (no hardware in scope; routing logic only, see demo scenario 3) |
-| NAT traversal (`kotoba.dtn.transport.udp`, real I/O) | yes — genuinely scoped: a UDP-native sibling transport (`node:dgram`, no TURN by default) plus an OPTIONAL relay path through a real [`kotoba-lang/org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn) TURN listener for exactly ONE configured peer per node; E2E demo green (3/3 scenarios, genuinely bidirectional); NOT full ICE (RFC 8445) — no NAT-type detection, no candidate gathering/connectivity checks, no automatic Allocate/permission refresh (single-shot handshake at `start-node!` time only, so relayed connectivity silently lapses ~5 minutes in), no multi-peer relaying from one node, see below |
+| NAT traversal (`kotoba.dtn.transport.udp`, real I/O) | yes — genuinely scoped: a UDP-native sibling transport (`node:dgram`, no TURN by default) plus an OPTIONAL relay path through a real [`kotoba-lang/org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn) TURN listener for exactly ONE configured peer per node; E2E demo green (4/4 scenarios, genuinely bidirectional, including a real wall-clock survival proof past the allocation's original expiry window); automatic periodic Allocate + permission Refresh keeps a `:turn-relay` node reachable indefinitely (closing what used to be this namespace's headline gap — see below); NOT full ICE (RFC 8445) — no NAT-type detection, no candidate gathering/connectivity checks, no multi-peer relaying from one node, see below |
 
 ## Contract
 
@@ -752,6 +752,73 @@ TURN-allocated relayed address, and can reply back through the same relay
 — genuine bidirectional delivery, proven for real in the E2E demo below,
 not simulated.
 
+**Automatic allocation + permission refresh.** This used to be this
+namespace's headline disclosed gap: Allocate + CreatePermission were
+called exactly ONCE, at `start-node!` time, and never refreshed again — a
+`:turn-relay` node that stayed up past ~5-10 minutes would have its
+permission (300s default) and then its allocation (600s default) silently
+expire server-side, after which relayed traffic in both directions started
+being silently dropped by the TURN server with zero warning. This is now
+closed: `start-node!` schedules a real, periodic RFC 8656 §7.3 Refresh
+(extends the allocation's own expiry) and a periodic re-CreatePermission
+(renews the peer permission's own, independent, shorter expiry) via
+`js/setInterval`, and `stop-node!` cancels that interval alongside closing
+the socket.
+
+**Cadence.** Refreshes fire at HALF of whatever lifetime the server's REAL
+initial Allocate response actually granted — read from its LIFETIME
+attribute (`kotoba.dtn.transport.turn-relay/response-lifetime`), never
+hardcoded/assumed. Half the granted lifetime is a conventional TURN/ICE
+client margin (the same rule e.g. libwebrtc's own TURN client uses):
+comfortably before the deadline even accounting for one refresh attempt
+failing outright and only being retried at the next scheduled tick. This
+cadence is computed ONCE, from the ORIGINAL Allocate's granted lifetime,
+and stays fixed for the node's entire remaining lifetime — deliberately
+NOT recomputed from whatever a later Refresh response happens to grant. A
+real, disclosed trade-off follows from that: if a TURN server ever granted
+a MUCH shorter lifetime than its usual default at some point mid-run —
+roughly anything under 2 seconds — a cadence fixed at half of a different
+(probably much longer) original grant could in principle fire its next
+tick after that later short-lived grant's own deadline. This is not a gap
+against org-ietf-turn's actual listener, which always grants the exact
+same fixed lifetime on every Allocate (verified by reading the source, not
+assumed) — it is a disclosed limit of this implementation's chosen
+approach for a hypothetical server that varies what it grants.
+
+**Failure handling (deliberately scoped down).** A single failed
+Refresh/CreatePermission-refresh attempt (relay temporarily unreachable,
+one lost UDP datagram, a timeout) is logged and left for the next
+scheduled tick — there is NO retry-before-next-tick, NO exponential
+backoff, and NO give-up-after-N-failures/circuit-breaker logic. The
+interval keeps firing regardless of any individual tick's outcome, so a
+transient failure self-heals at the next tick as long as the underlying
+reachability problem was itself transient; a genuinely permanent relay
+outage is not specially detected or alerted on beyond the ordinary per-tick
+log lines. A real production TURN client would need actual retry/backoff/
+alerting on top of this — deliberately not built here, per this feature's
+own scope.
+
+**A real, documented asymmetry in what org-ietf-turn's listener honors.**
+Read directly from `kotoba.turn.listener`'s source (not assumed):
+`handle-allocate!` never inspects a LIFETIME attribute on the ORIGINAL
+Allocate request at all — it always grants its own fixed
+`kotoba.turn.allocation/default-lifetime-s` (600s), regardless of what a
+client asks for. `handle-refresh!`, by contrast, genuinely DOES read and
+honor a client-requested LIFETIME on Refresh. Production scheduled
+refreshes never rely on this (they omit LIFETIME entirely, letting the
+server's default apply); it matters for how the E2E demo's Scenario 4
+constructs a short, real, observable expiry window for its survival proof,
+since the literal initial 600s Allocate grant cannot be shrunk at all — see
+that scenario, below, for the full disclosure.
+
+**Test-only tuning knobs.** `:turn-relay` accepts two additional OPTIONAL
+keys, `:refresh-interval-ms` and `:refresh-lifetime-s`, that override the
+computed cadence and make every scheduled Refresh request an explicit
+(typically short) lifetime, respectively — NOT meant for production use,
+they exist purely so a demo/test can observe refresh behavior in real
+seconds rather than real minutes. See `schedule-turn-refresh!`'s own
+docstring and Scenario 4, below.
+
 **What this deliberately is NOT — same "claim exactly what was built"
 discipline as every other namespace in this repo:**
 
@@ -760,15 +827,14 @@ discipline as every other namespace in this repo:**
   pick the best of several candidate pairs. There is exactly ONE candidate
   for reaching a NAT'd peer — its TURN-relayed address — supplied directly
   by the caller, never discovered or negotiated.
-- **NOT automatic permission/allocation refresh.** Allocate +
-  CreatePermission is called exactly ONCE, at `start-node!` time. RFC
-  8656's default permission lifetime is 300s and allocation lifetime is
-  600s (`kotoba.turn.allocation`'s own defaults) — a `:turn-relay` node
-  that stays up past ~5 minutes will have its permission silently expire
-  server-side, after which relayed traffic in both directions starts being
-  silently dropped by the TURN server with zero warning from this
-  namespace. A production implementation needs a scheduled Refresh well
-  before both expire — not implemented here.
+- **NOT full production-grade refresh retry/backoff.** See "Failure
+  handling" above — a single failed refresh attempt is logged and left to
+  the next scheduled tick, nothing more.
+- **NOT an explicit allocation teardown on `stop-node!`.** No RFC 8656
+  §7.3 Refresh-with-LIFETIME-0 "delete this allocation now" signal is sent
+  before closing — the allocation simply expires server-side on its own
+  timer once this node stops refreshing it (same as before this revision,
+  just delayed by however many refresh cycles already ran).
 - **NOT relay-unreachable fallback.** If the TURN server goes down, or a
   Send indication is simply lost (UDP, no retransmission), this namespace
   does not fall back to a direct send and does not retry the relay — there
@@ -812,8 +878,8 @@ nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/sr
   test/kotoba/dtn/transport/udp_turn_demo.cljs
 ```
 
-Three scenarios, printing `PASS`/`FAIL` per scenario and a final
-`RESULT: N/3 scenarios passed` line (exit 0 iff 3/3):
+Four scenarios, printing `PASS`/`FAIL` per scenario and a final
+`RESULT: N/4 scenarios passed` line (exit 0 iff 4/4):
 
 1. **Baseline** — two dtn nodes, NEITHER behind NAT (no `:turn-relay`
    config on either), exchange a real message directly over
@@ -839,6 +905,42 @@ Three scenarios, printing `PASS`/`FAIL` per scenario and a final
    entire node-handle map, not just the one `:peers` key this demo happens
    to know to check. Proves scenario 2's success is not an accidental
    direct-connection fallback dressed up as a relay proof.
+4. **Survival past the allocation's original expiry window (real
+   wall-clock proof) — 4a positive + 4b negative control.** Proves the
+   automatic periodic Refresh added above actually keeps a `:turn-relay`
+   allocation reachable past a real expiry deadline, using a genuine
+   `js/setTimeout`-based wait, not a mocked clock. **Honesty disclosure
+   first:** org-ietf-turn's `handle-allocate!` ignores a client-requested
+   LIFETIME on the original Allocate request entirely (always grants the
+   fixed 600s default — confirmed both by reading the source and by
+   scenario 2's own `granted-lifetime-s=600` log line), so this scenario
+   cannot shrink the literal initial Allocate grant to make a 600s wait
+   practical for an automated demo. Instead it uses `handle-refresh!`'s
+   genuinely-honored client-requested LIFETIME — the same real mechanism
+   production scheduled refreshes use — to bring a real, live allocation
+   down to a short (3s), server-granted expiry window on its very first
+   scheduled tick, then proves continued scheduled refreshing keeps
+   pushing that real deadline forward. **4a (positive):** node A is
+   started with `:refresh-lifetime-s 3` and `:refresh-interval-ms 900`
+   (test-only overrides — a real deployment would set neither). A baseline
+   message is sent immediately (matches scenario 2's proof the relay
+   works at all); the demo then waits 5.5 REAL seconds (multiple scheduled
+   refresh ticks fire in the background during the wait) and sends a
+   second message; the demo confirms it still arrives — proving the
+   allocation is still alive well past the 3s window its first scheduled
+   refresh established. **4b (negative control):** a fresh node pair
+   establishes the IDENTICAL short window via one manual
+   `refresh-turn-allocation!` call, but with the automatic scheduler
+   explicitly disabled (its `js/setInterval` cleared) immediately
+   afterward — no further refresh is ever sent. After the SAME 5.5s real
+   wait, a message sent through that allocation does NOT arrive — the
+   TURN listener's own periodic expiry sweep (a `:sweep-interval-ms 300`
+   override on this scenario's own listener instance, so the drop is
+   observable in seconds — `start-listener!`'s own supported option, not a
+   modification to org-ietf-turn) has genuinely dropped the allocation
+   server-side by then. This negative control makes 4a's positive proof
+   non-vacuous: it demonstrates, empirically, what would have happened to
+   4a WITHOUT this whole feature.
 
 ## License
 

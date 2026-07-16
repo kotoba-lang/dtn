@@ -80,18 +80,34 @@
       supplied directly by the caller (see the E2E demo's own explicit
       'B only knows A's relay address, never A's real port' framing),
       never discovered or negotiated.
-    - NOT automatic permission/allocation refresh. RFC 8656's default
-      allocation lifetime is 600s and a permission's is 300s (see
-      kotoba.turn.allocation's own defaults) — this namespace calls
-      Allocate + CreatePermission exactly ONCE, at start-node! time, and
-      never calls Refresh again. A node whose :turn-relay stays up past
-      ~5 minutes will have its permission silently expire server-side
+    - AUTOMATIC ALLOCATION + PERMISSION REFRESH — IMPLEMENTED (this was
+      previously this namespace's headline gap; closing it is what this
+      whole revision is for). RFC 8656's default allocation lifetime is
+      600s and a permission's is 300s (see kotoba.turn.allocation's own
+      defaults) — Allocate + CreatePermission used to be called exactly
+      ONCE, at start-node! time, with no Refresh ever sent again, so a
+      :turn-relay node that stayed up past ~5-10 minutes would have its
+      permission and then its allocation silently expire server-side
       (org-ietf-turn's own periodic sweep drops it), after which relayed
-      sends TO that peer, and the peer's relayed replies, both start being
-      silently dropped by the TURN server with zero warning from this
-      namespace. A production implementation needs a scheduled Refresh
-      well before both the 300s permission and 600s allocation expire —
-      not implemented here.
+      traffic in both directions started being silently dropped by the
+      TURN server with zero warning from this namespace. `start-node!` now
+      schedules a real, periodic RFC 8656 §7.3 Refresh (extends the
+      allocation's own expiry) AND a periodic re-CreatePermission (renews
+      the peer permission's own, independent, shorter expiry) via
+      `js/setInterval`, at HALF of whatever lifetime the server's REAL
+      initial Allocate response actually granted (read from its LIFETIME
+      attribute, never assumed/hardcoded — see refresh-turn-allocation!
+      and schedule-turn-refresh!'s own docstrings for the exact cadence
+      math and its scope limits). `stop-node!` cancels this interval along
+      with closing the socket. See those two functions' docstrings, and
+      README.md's 'NAT traversal' section, for the full design, including
+      the documented asymmetry that org-ietf-turn's Allocate handler
+      ignores a client-requested LIFETIME entirely while its Refresh
+      handler genuinely honors one (verified by reading the source, not
+      assumed), and the scoped-down failure-handling behavior (a single
+      failed refresh attempt is logged and left to the next scheduled
+      tick — no retry-before-next-tick, no exponential backoff, no
+      give-up-after-N-failures/circuit-breaker logic).
     - NOT relay-unreachable fallback. If the TURN server itself goes down,
       or a Send indication is simply lost (UDP, no retransmission), this
       namespace does not fall back to a direct send, does not retry the
@@ -378,12 +394,20 @@
   handler AFTER this resolves, so there is no listener conflict with the
   sequential .once-based exchanges here). Returns a
   Promise<{:relayed-address {:ip [o1 o2 o3 o4] :port n} :username ..
-  :credential ..} | nil> — nil on ANY failure (timeout, an error response,
-  a malformed response), logged here; start-node! decides what a nil
-  result means for the whole node's startup (see there — it rejects the
-  overall start-node! Promise, since a node explicitly configured with
-  :turn-relay that can't actually establish one has failed to start as
-  configured, not silently degraded to a working-but-unrelayed node)."
+  :credential .. :granted-lifetime-s n} | nil> — nil on ANY failure
+  (timeout, an error response, a malformed response), logged here;
+  start-node! decides what a nil result means for the whole node's startup
+  (see there — it rejects the overall start-node! Promise, since a node
+  explicitly configured with :turn-relay that can't actually establish one
+  has failed to start as configured, not silently degraded to a
+  working-but-unrelayed node). `:granted-lifetime-s` is the REAL lifetime
+  (seconds) the server's Allocate response actually granted, decoded via
+  kotoba.dtn.transport.turn-relay/response-lifetime — never assumed to be
+  RFC 8656's 600s default, even though org-ietf-turn's own
+  kotoba.turn.listener/handle-allocate! currently always grants exactly
+  that (it never inspects a LIFETIME attribute on the request at all — see
+  this namespace's docstring). start-node! uses this value to compute
+  schedule-turn-refresh!'s once-only refresh cadence."
   [node-handle-atom sock {:keys [server-host server-port shared-secret peer-address]}]
   (let [e164 (:e164 (deref node-handle-atom))
         now-s (quot (js/Date.now) 1000)
@@ -398,14 +422,16 @@
         (let [[alloc-raw _] alloc-result
               parsed (tr/parse-stun-message alloc-raw)
               header (:header parsed)
-              relayed (tr/allocate-response-relayed-address (:attrs parsed))]
+              relayed (tr/allocate-response-relayed-address (:attrs parsed))
+              granted-lifetime-s (tr/response-lifetime (:attrs parsed))]
           (if-not (and header (= (:typ header) stun/allocate-response) relayed)
             (do (log! node-handle-atom "udp: TURN Allocate rejected or malformed response (type="
                       (:typ header) ", want " stun/allocate-response ")")
                 nil)
             (do
               (log! node-handle-atom "udp: TURN Allocate succeeded, relayed-address="
-                    (tr/ip-vec->str (:ip relayed)) ":" (:port relayed))
+                    (tr/ip-vec->str (:ip relayed)) ":" (:port relayed)
+                    ", granted-lifetime-s=" granted-lifetime-s)
               (let [peer-ip (tr/ip-str->vec (:address peer-address))
                     peer-port (:port peer-address)
                     perm-req (tr/build-create-permission-request username credential peer-ip peer-port (rand-txid))]
@@ -424,7 +450,318 @@
                             nil)
                         (do
                           (log! node-handle-atom "udp: TURN CreatePermission succeeded")
-                          {:relayed-address relayed :username username :credential credential})))))))))))))
+                          {:relayed-address relayed :username username :credential credential
+                           :granted-lifetime-s granted-lifetime-s})))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; TURN relay client — automatic periodic Allocate refresh + permission
+;; refresh. THIS IS THE GAP THIS REVISION CLOSES: turn-allocate-and-permit!
+;; (above) still only runs ONCE, at start-node! time — that part is
+;; unchanged. What's new is that start-node! now ALSO schedules
+;; refresh-turn-allocation!/refresh-turn-permission! on a recurring
+;; js/setInterval (schedule-turn-refresh!, below) for as long as the node
+;; stays up, so the allocation this node depends on for ALL its relayed
+;; traffic never silently lapses the way it always used to past ~5-10
+;; minutes of uptime.
+;; ---------------------------------------------------------------------------
+
+(defn- send-and-wait-for-reply!
+  "Like send-and-wait-once! (above), but SAFE TO USE AFTER the node's
+  ongoing 'message' handler has already been installed (see start-node!) —
+  used by refresh-turn-allocation!/refresh-turn-permission!, below, which
+  run for the ENTIRE lifetime of a :turn-relay node, concurrently with
+  normal relayed traffic arriving on the very same socket.
+  send-and-wait-once! blindly treats the very NEXT inbound datagram as the
+  reply to what it just sent — its own docstring already says this is only
+  actually safe 'while used sequentially during the startup handshake...
+  before any OTHER 'message' listener is installed'. That assumption does
+  NOT hold once this node is up and running: an inbound relayed Data
+  indication (a real bundle from the peer) could legitimately arrive in
+  between this function's send and its actual STUN reply, and blindly
+  treating THAT as the reply would both (a) misinterpret a real bundle
+  delivery as a malformed refresh response, discarding it as a parse/type
+  mismatch, and (b) 'steal' the event so the node's ongoing inbound handler
+  never gets a chance to actually deliver that bundle — a genuine correctness
+  bug, not merely a startup-only inconvenience.
+
+  This function instead registers a standing `.on` listener (removed again
+  once it resolves, on success OR timeout) that inspects EVERY inbound
+  datagram and only resolves for the one whose parsed STUN header
+  transaction id equals `txid` — the exact txid this function's own caller
+  generated for the request it is about to send. Anything else (a genuine
+  relayed Data indication, an unrelated stray STUN message, a duplicate/late
+  reply to an earlier already-timed-out request) is left completely alone —
+  it simply falls through to whatever OTHER listener(s) are also registered
+  on this same socket. This is safe and correct because Node's EventEmitter
+  calls EVERY registered listener for an emitted event, not just one: the
+  node's ongoing handle-relayed-datagram! listener sees every datagram this
+  function's listener also sees, independently and unaffected — including
+  this function's own refresh-reply traffic, which handle-relayed-datagram!
+  will classify as :other-stun (not a Data indication) and harmlessly log +
+  drop (see kotoba.dtn.transport.turn-relay/classify-inbound-datagram's
+  own docstring for that documented, expected side effect). Resolves
+  [byte-vector rinfo], or nil if nothing matching `txid` arrives within
+  timeout-ms."
+  [sock data host port timeout-ms txid]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [done (atom false)
+           listener-fn (atom nil)
+           finish! (fn [v]
+                      (when-not @done
+                        (reset! done true)
+                        (when-let [f @listener-fn] (.removeListener sock "message" f))
+                        (resolve v)))
+           timer (js/setTimeout #(finish! nil) timeout-ms)
+           on-message (fn [msg _rinfo]
+                        (let [raw (vec msg)
+                              {:keys [header]} (tr/parse-stun-message raw)]
+                          (when (and header (= (:txid header) txid))
+                            (js/clearTimeout timer)
+                            (finish! [raw nil]))))]
+       (reset! listener-fn on-message)
+       (.on sock "message" on-message)
+       (.send sock (vec->buf data) port host (fn [err] (when err (finish! nil))))))))
+
+(defn refresh-turn-allocation!
+  "Send one real RFC 8656 §7.3 Refresh request for node-handle-atom's
+  current :turn-relay allocation, over the SAME socket the node already
+  uses for all its ongoing traffic — safe to call at any point after
+  start-node!'s Promise has resolved (uses send-and-wait-for-reply! above,
+  NOT the startup-only send-and-wait-once!). Public (not `defn-`) so both
+  schedule-turn-refresh! (below) and a demo/test can call it directly — see
+  test/kotoba/dtn/transport/udp_turn_demo.cljs Scenario 4, which calls this
+  manually (outside the normal scheduled interval) to construct its
+  survival-past-expiry proof.
+
+  Re-mints a FRESH short-term credential
+  (kotoba.turn.credential/mint-credential, 600s TTL from the CURRENT wall
+  clock) rather than reusing the one minted at start-node! time — a real
+  long-running :turn-relay node calling this repeatedly, hours or days
+  apart, would otherwise keep presenting an ever-more-stale credential.
+  This makes zero *functional* difference against the exact version of
+  kotoba.turn.listener this was built and tested against — its own
+  docstring's 'AUTHENTICATION SCOPE' section states plainly that only the
+  Allocate request is cryptographically verified at all; Refresh is
+  authorized purely by 'does a live allocation exist for this client's
+  observed address/port', never checking MESSAGE-INTEGRITY — but keeps this
+  client wire-correct/forward-compatible if a later listener phase closes
+  that gap (that same docstring names it as 'straightforward future work').
+
+  `lifetime-s`, when given, is sent as an explicit LIFETIME attribute —
+  kotoba.turn.listener's handle-refresh! DOES read and honor this (verified
+  by reading the source — see kotoba.dtn.transport.turn-relay/build-refresh-request's
+  own docstring for the exact confirmation and the contrasting Allocate
+  behavior). When omitted (the normal scheduled call, see
+  schedule-turn-refresh!), no LIFETIME attribute is sent at all — RFC 8656
+  §7.3: absent LIFETIME means 'use the server's default' (currently
+  equivalent to re-granting 600s against this listener).
+
+  Returns a Promise<granted-lifetime-s-int-or-nil> — the server's ACTUAL
+  granted lifetime in seconds, decoded from the real Refresh response's own
+  LIFETIME attribute via kotoba.dtn.transport.turn-relay/response-lifetime
+  (never assumed/hardcoded) — or nil on ANY failure (timeout, error
+  response, malformed response, no :turn-relay configured/handshake not
+  complete on this node at all). Never throws; logged here. See
+  schedule-turn-refresh! for how a nil result from a SCHEDULED call is
+  handled (logged, not fatal to the node)."
+  [node-handle-atom & {:keys [lifetime-s]}]
+  (let [{:keys [turn-relay turn-relay-state socket e164]} (deref node-handle-atom)]
+    (if-not (and turn-relay turn-relay-state socket)
+      (p/resolved nil)
+      (let [{:keys [server-host server-port shared-secret]} turn-relay
+            now-s (quot (js/Date.now) 1000)
+            {:keys [username credential]} (cred/mint-credential shared-secret e164 600 now-s)
+            txid (rand-txid)
+            req (tr/build-refresh-request username credential txid lifetime-s)]
+        (log! node-handle-atom "udp: TURN Refresh -> " server-host ":" server-port
+              (if lifetime-s (str " requesting lifetime-s=" lifetime-s) " (server default lifetime)"))
+        (p/let [result (send-and-wait-for-reply! socket req server-host server-port
+                                                  turn-handshake-timeout-ms txid)]
+          (if-not result
+            (do (log! node-handle-atom "udp: TURN Refresh timed out, no response from "
+                      server-host ":" server-port " (will retry on next scheduled interval)")
+                nil)
+            (let [[raw _] result
+                  parsed (tr/parse-stun-message raw)
+                  header (:header parsed)]
+              (if-not (and header (= (:typ header) stun/refresh-response))
+                (do (log! node-handle-atom "udp: TURN Refresh rejected or malformed response (type="
+                          (:typ header) ", want " stun/refresh-response ")")
+                    nil)
+                (let [granted-s (tr/response-lifetime (:attrs parsed))]
+                  (log! node-handle-atom "udp: TURN Refresh succeeded, granted-lifetime-s=" granted-s)
+                  (swap! node-handle-atom update :turn-relay-state merge
+                         {:username username :credential credential
+                          :last-refresh-ms (js/Date.now) :last-granted-lifetime-s granted-s})
+                  granted-s)))))))))
+
+(defn refresh-turn-permission!
+  "Send one real RFC 8656 §9 CreatePermission request, RE-installing the
+  permission for node-handle-atom's already-configured :turn-relay
+  :peer-address — per kotoba.turn.allocation/create-permission's own
+  docstring ('Install or refresh a permission... does not touch
+  :turn/expiry'), this IS how a TURN client refreshes a permission; there
+  is no separate 'RefreshPermission' message type in RFC 8656. Public (not
+  `defn-`) for the same reasons refresh-turn-allocation! is.
+
+  A permission's own default lifetime (300s, RFC 8656 §9,
+  kotoba.turn.allocation/default-permission-lifetime-s) is INDEPENDENT of,
+  and shorter than, the allocation's own lifetime (600s default) — it
+  needs its own periodic renewal, distinct from refresh-turn-allocation!
+  above, even though (see schedule-turn-refresh!, which is the only
+  production caller of both) this scoped implementation piggybacks both
+  onto the SAME js/setInterval tick rather than two independently-timed
+  schedules — see that function's docstring for why that's safe here.
+
+  Re-mints a fresh short-term credential exactly as refresh-turn-allocation!
+  does, for the identical reason (see that function's docstring).
+
+  Returns a Promise<true|false> — true iff the server replied with a real
+  CreatePermission SUCCESS response, false on ANY failure (timeout, error
+  response, malformed response, no :turn-relay configured/handshake not
+  complete). Never throws; logged here."
+  [node-handle-atom]
+  (let [{:keys [turn-relay turn-relay-state socket e164]} (deref node-handle-atom)]
+    (if-not (and turn-relay turn-relay-state socket)
+      (p/resolved false)
+      (let [{:keys [server-host server-port shared-secret peer-address]} turn-relay
+            now-s (quot (js/Date.now) 1000)
+            {:keys [username credential]} (cred/mint-credential shared-secret e164 600 now-s)
+            peer-ip (tr/ip-str->vec (:address peer-address))
+            peer-port (:port peer-address)
+            txid (rand-txid)
+            req (tr/build-create-permission-request username credential peer-ip peer-port txid)]
+        (log! node-handle-atom "udp: TURN CreatePermission refresh for peer " (:address peer-address) ":" peer-port)
+        (p/let [result (send-and-wait-for-reply! socket req server-host server-port
+                                                  turn-handshake-timeout-ms txid)]
+          (if-not result
+            (do (log! node-handle-atom "udp: TURN CreatePermission refresh timed out (will retry on next scheduled interval)")
+                false)
+            (let [[raw _] result
+                  parsed (tr/parse-stun-message raw)
+                  header (:header parsed)
+                  ok? (boolean (and header (= (:typ header) stun/create-permission-response)))]
+              (if ok?
+                (do (log! node-handle-atom "udp: TURN CreatePermission refresh succeeded")
+                    (swap! node-handle-atom update :turn-relay-state assoc :last-permission-refresh-ms (js/Date.now))
+                    true)
+                (do (log! node-handle-atom "udp: TURN CreatePermission refresh rejected or malformed response (type="
+                          (:typ header) ")")
+                    false)))))))))
+
+;; RFC 8656 §5 default allocation lifetime, used here ONLY as a defensive
+;; fallback if a real Allocate SUCCESS response somehow omitted its own
+;; LIFETIME attribute (never observed against org-ietf-turn's actual
+;; listener, which always includes one — see turn-allocate-and-permit! —
+;; but schedule-turn-refresh! still needs SOME positive number to compute
+;; an interval from rather than dividing by nil/zero). Not a claim that
+;; this is what any particular server actually grants — see
+;; turn-allocate-and-permit!'s own docstring for how the REAL granted value
+;; is read instead, whenever the response actually carries one.
+(def ^:private rfc8656-default-lifetime-fallback-s 600)
+
+(defn- schedule-turn-refresh!
+  "Install the js/setInterval that keeps a :turn-relay-configured node's
+  allocation AND permission alive for as long as the node process runs —
+  this is the actual fix for the gap this namespace's docstring used to
+  name: Allocate + CreatePermission used to be called exactly ONCE, at
+  start-node! time, so ANY :turn-relay node that stayed up past its
+  allocation's granted lifetime would go silently unreachable in both
+  directions. Called once, from start-node!, only after
+  turn-allocate-and-permit! has already succeeded. Returns the
+  js/setInterval id — start-node! stores it on the node handle as
+  :turn-refresh-interval-id, and stop-node! clears it.
+
+  CADENCE (the actual choice, and why). Refreshes at HALF of the
+  `granted-lifetime-s` this node's ORIGINAL Allocate response actually
+  reported (passed in by start-node!, itself read via
+  kotoba.dtn.transport.turn-relay/response-lifetime off the real response —
+  never hardcoded/assumed to be RFC 8656's 600s default, even though
+  org-ietf-turn's listener currently always grants exactly that). Half the
+  granted lifetime is a conventional, widely-used TURN/ICE client margin
+  (e.g. libwebrtc's own ICE/TURN allocation-refresh timer uses the same
+  lifetime/2 rule) — comfortably before the deadline even accounting for
+  one refresh attempt that fails outright and is only retried at the NEXT
+  tick (see the failure-handling note below): two ticks spaced
+  lifetime/2 apart land EXACTLY at the original deadline in the worst case
+  (one missed refresh followed by a successful one right at the wire), and
+  a real UDP round-trip to a TURN server is on the order of milliseconds to
+  low hundreds-of-milliseconds on the timescale TURN lifetimes (whole
+  seconds to minutes) actually operate on, so that worst case still lands
+  with the refresh's response processed before expiry in practice.
+
+  Computed ONCE, from the ORIGINAL Allocate's granted lifetime, and FIXED
+  for the node's entire remaining lifetime — deliberately NOT recomputed
+  from whatever a LATER Refresh response happens to grant (a real, disclosed
+  scope cut, not an oversight): if a TURN server ever granted a MUCH
+  shorter lifetime than the 600s default at some point mid-run — anything
+  under roughly 2 seconds — a cadence fixed at half of a DIFFERENT
+  (probably much longer) original grant could, in principle, end up firing
+  its next scheduled tick AFTER that later short-lived grant's own
+  deadline, which this implementation does not detect or defend against.
+  This is a real gap for a hypothetical server that changes its granted
+  lifetime dramatically between refreshes; it is NOT a gap against
+  org-ietf-turn's actual listener, which always grants the exact same fixed
+  `kotoba.turn.allocation/default-lifetime-s` every single time (verified
+  by reading handle-allocate!/handle-refresh! — neither ever varies what it
+  grants based on anything but a client-requested LIFETIME on Refresh,
+  which this implementation's own SCHEDULED calls never send — see
+  refresh-turn-allocation!). `:refresh-lifetime-s` (below) is the one way
+  THIS client can trigger that scenario itself, and it exists only for
+  testing (see the demo).
+
+  `:refresh-interval-ms` / `:refresh-lifetime-s` (both OPTIONAL keys inside
+  the :turn-relay opts map) are TEST-ONLY escape hatches, not meant for a
+  normal production deployment:
+    - `:refresh-interval-ms`, when given, overrides the computed
+      half-granted-lifetime cadence outright with a fixed number of
+      milliseconds.
+    - `:refresh-lifetime-s`, when given, makes EVERY scheduled Refresh
+      request an explicit (short) LIFETIME instead of omitting it (server
+      default). Combined with a short `:refresh-interval-ms`, this is how
+      test/kotoba/dtn/transport/udp_turn_demo.cljs's Scenario 4 constructs
+      a short, REAL, observable expiry window at all — org-ietf-turn's
+      Allocate handler ignores a client-requested LIFETIME entirely (see
+      this namespace's docstring), so there is no way to get a short-lived
+      allocation any other way without waiting out the real 600s default,
+      which is impractical for an automated demo. See that scenario's own
+      comments for the full trade-off disclosure.
+
+  FAILURE HANDLING (scoped down — see this namespace's docstring / README
+  for the same disclosure at the feature level). A single failed
+  refresh-turn-allocation!/refresh-turn-permission! call (relay temporarily
+  unreachable, one lost UDP datagram, a timeout) is logged (by those
+  functions themselves) and otherwise ignored here — NOT retried before the
+  next scheduled tick, no exponential backoff, no
+  give-up-after-N-failures/circuit-breaker logic. The interval keeps firing
+  regardless of any individual tick's outcome, so a transient failure
+  self-heals at the next tick as long as the underlying reachability
+  problem was itself transient; a PERMANENT relay outage is not specially
+  detected or reported beyond the ordinary per-tick log lines. Both
+  Promises returned by each tick's calls are `.catch`'d here specifically
+  so a REJECTED Promise (as opposed to those functions' own already-handled
+  'resolve nil/false on failure' path) still cannot crash the node process
+  via an unhandled Promise rejection — a real production client would need
+  actual retry/backoff/alerting logic on top of this; this implementation
+  deliberately does not build that, per this task's own scope."
+  [node-handle-atom granted-lifetime-s]
+  (let [{:keys [turn-relay]} (deref node-handle-atom)
+        {:keys [refresh-interval-ms refresh-lifetime-s]} turn-relay
+        effective-lifetime-s (or granted-lifetime-s rfc8656-default-lifetime-fallback-s)
+        interval-ms (or refresh-interval-ms (long (* 500 effective-lifetime-s)))
+        interval-id (js/setInterval
+                     (fn []
+                       (-> (refresh-turn-allocation! node-handle-atom :lifetime-s refresh-lifetime-s)
+                           (.catch (fn [e] (log! node-handle-atom "udp: TURN allocation refresh tick threw, ignoring (next tick will retry): " (.-message e)))))
+                       (-> (refresh-turn-permission! node-handle-atom)
+                           (.catch (fn [e] (log! node-handle-atom "udp: TURN permission refresh tick threw, ignoring (next tick will retry): " (.-message e))))))
+                     interval-ms)]
+    (log! node-handle-atom "udp: TURN refresh scheduled every " interval-ms
+          "ms (= half of granted allocation lifetime " effective-lifetime-s "s)"
+          (when refresh-lifetime-s (str " [TEST-ONLY: requesting lifetime-s=" refresh-lifetime-s " on every scheduled Refresh]"))
+          (when refresh-interval-ms " [TEST-ONLY: interval override in effect]"))
+    interval-id))
 
 ;; ---------------------------------------------------------------------------
 ;; Node lifecycle
@@ -451,7 +788,9 @@
          :replay-state-path <path>                    ; optional, see kotoba.dtn.transport.tcp
          :turn-relay {:server-host \"...\" :server-port N
                        :shared-secret \"...\"
-                       :peer-address {:address \"...\" :port N}}}  ; optional, NEW, see below
+                       :peer-address {:address \"...\" :port N}
+                       :refresh-interval-ms N     ; optional, TEST-ONLY, see schedule-turn-refresh!
+                       :refresh-lifetime-s N}}     ; optional, TEST-ONLY, see schedule-turn-refresh!
 
   :store-path / :peer-secrets / :routes / :replay-state-path have IDENTICAL
   semantics to kotoba.dtn.transport.tcp's own options of the same name —
@@ -478,7 +817,12 @@
   fails for any reason (server unreachable, wrong :shared-secret,
   malformed response), the returned Promise REJECTS (this node explicitly
   asked to be NAT-traversal-capable and could not become so; that is a
-  startup failure, not a silent degrade to unrelayed behavior).
+  startup failure, not a silent degrade to unrelayed behavior). Once the
+  handshake succeeds, start-node! ALSO installs schedule-turn-refresh!'s
+  recurring js/setInterval BEFORE resolving — see that function's own
+  docstring for the exact cadence and scope. `:turn-refresh-interval-id`
+  on the resolved node handle is nil for a non-:turn-relay node (no
+  scheduling to do at all).
 
   Returns (once resolved) an atom (the 'node handle') holding:
     {:e164 e164 :port port :peers peers
@@ -487,8 +831,14 @@
      :next-sequence-number <int> :store [] :inbox [] :seen-bundle-ids #{}
      :socket <node:dgram socket>
      :turn-relay <the :turn-relay opts given, or nil>
-     :turn-relay-state {:relayed-address {:ip [..] :port n} ...}  ; nil
-       unless :turn-relay was configured and the handshake succeeded"
+     :turn-relay-state {:relayed-address {:ip [..] :port n} :username ..
+       :credential .. :granted-lifetime-s n :last-refresh-ms ..
+       :last-granted-lifetime-s .. :last-permission-refresh-ms ..}  ; nil
+       unless :turn-relay was configured and the handshake succeeded —
+       the :last-* keys are absent until at least one scheduled/manual
+       refresh has actually completed
+     :turn-refresh-interval-id <js/setInterval id, or nil>}  ; nil unless
+       :turn-relay was configured and the handshake succeeded"
   [{:keys [e164 port peers store-path peer-secrets routes replay-state-path turn-relay]}]
   (let [node-handle-atom (atom {:e164 e164 :port port :peers (or peers {})
                                  :store-path store-path
@@ -504,7 +854,8 @@
                                  :seen-bundle-ids #{}
                                  :socket nil
                                  :turn-relay turn-relay
-                                 :turn-relay-state nil})]
+                                 :turn-relay-state nil
+                                 :turn-refresh-interval-id nil})]
     (js/Promise.
      (fn [resolve reject]
        (let [socket (dgram/createSocket "udp4")]
@@ -525,6 +876,9 @@
                                      (swap! node-handle-atom assoc :turn-relay-state result)
                                      (.on socket "message"
                                           (fn [msg _rinfo] (handle-relayed-datagram! node-handle-atom msg)))
+                                     (let [interval-id (schedule-turn-refresh!
+                                                         node-handle-atom (:granted-lifetime-s result))]
+                                       (swap! node-handle-atom assoc :turn-refresh-interval-id interval-id))
                                      (resolve node-handle-atom)))))
                         (.catch reject))
                     (do
@@ -536,14 +890,25 @@
   "Close node-handle-atom's UDP socket. Returns a Promise resolved once the
   socket has actually closed (so callers can safely re-start-node! on the
   same port right after) — mirrors
-  kotoba.dtn.transport.tcp/stop-node!'s own contract. No automatic Refresh
-  or Allocate-teardown is sent to a configured :turn-relay server before
-  closing (see namespace docstring — no permission-refresh scheduling
-  means no permission-TEARDOWN messaging either, in this scoped version);
-  the allocation simply expires server-side on its own 600s timer."
+  kotoba.dtn.transport.tcp/stop-node!'s own contract. ALSO clears
+  :turn-refresh-interval-id (schedule-turn-refresh!'s js/setInterval), if
+  one is set — the dangling-timer counterpart of start-node! installing it;
+  omitting this would leak a live interval (and keep the process from
+  exiting cleanly) referencing an atom whose :socket is about to go nil,
+  spuriously firing refresh-turn-allocation!/refresh-turn-permission! calls
+  against a node that's no longer listening. No explicit RFC 8656 §7.3
+  Refresh-with-LIFETIME-0 teardown is sent to a configured :turn-relay
+  server before closing (a real 'delete this allocation now' signal, which
+  RFC 8656 supports but this scoped implementation does not send) — the
+  allocation simply expires server-side on its own timer once this node
+  stops refreshing it, same as before this revision, just delayed by
+  however many refresh cycles already ran."
   [node-handle-atom]
   (js/Promise.
    (fn [resolve _reject]
+     (when-let [interval-id (:turn-refresh-interval-id (deref node-handle-atom))]
+       (js/clearInterval interval-id)
+       (swap! node-handle-atom assoc :turn-refresh-interval-id nil))
      (let [{:keys [socket]} (deref node-handle-atom)]
        (if socket
          (.close socket (fn [] (swap! node-handle-atom assoc :socket nil) (resolve true)))

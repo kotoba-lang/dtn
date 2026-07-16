@@ -32,14 +32,26 @@
   SCOPED, NOT FULL ICE (see kotoba.dtn.transport.udp's own namespace
   docstring for the complete, honest disclosure of what this whole
   NAT-traversal capability does and does not cover). Specifically in THIS
-  namespace: only Allocate + CreatePermission + Send/Data indication are
-  modeled — no ChannelBind fast-path construction (a NAT'd dtn node's
-  outbound traffic always goes as a full STUN Send indication, a few more
-  bytes per message than a bound channel would cost once amortized — a
-  disclosed, deliberate scope cut, not an oversight; org-ietf-turn's own
-  listener still supports ChannelBind server-side, this namespace's client
-  just never uses it), and no Refresh-request construction (no automatic
-  re-Allocate before expiry — see kotoba.dtn.transport.udp)."
+  namespace: only Allocate + CreatePermission + Refresh + Send/Data
+  indication are modeled — no ChannelBind fast-path construction (a NAT'd
+  dtn node's outbound traffic always goes as a full STUN Send indication, a
+  few more bytes per message than a bound channel would cost once
+  amortized — a disclosed, deliberate scope cut, not an oversight;
+  org-ietf-turn's own listener still supports ChannelBind server-side, this
+  namespace's client just never uses it).
+
+  Refresh-request construction (`build-refresh-request`, below) was added
+  alongside kotoba.dtn.transport.udp's automatic periodic allocation/
+  permission refresh — closing the gap this namespace's docstring used to
+  name here ('no Refresh-request construction... no automatic re-Allocate
+  before expiry'). See kotoba.dtn.transport.udp's own docstring for the
+  full design (cadence, failure handling) and README.md's 'NAT traversal'
+  section for a verified-by-reading-the-source disclosure of an important
+  asymmetry: org-ietf-turn's `kotoba.turn.listener/handle-allocate!` never
+  inspects a LIFETIME attribute on the original Allocate request at all (it
+  always grants its own fixed `kotoba.turn.allocation/default-lifetime-s`,
+  600s, regardless of what a client asks for), but its `handle-refresh!`
+  genuinely DOES read and honor a client-requested LIFETIME on Refresh."
   (:require [clojure.string :as str]
             [kotoba.bytes :as b]
             [kotoba.turn.stun :as stun]
@@ -101,6 +113,48 @@
       (stun/append-message-integrity (b/utf8-encode credential))
       stun/append-fingerprint))
 
+(defn build-refresh-request
+  "STUN Refresh request (RFC 8656 §7.3): USERNAME + optional LIFETIME,
+  signed with MESSAGE-INTEGRITY under the SAME verified credential the
+  original Allocate used (RFC 8656 requires the same short-term credential
+  for every request within one allocation's lifetime), closed with
+  FINGERPRINT — structurally near-identical to build-allocate-request
+  (minus REQUESTED-TRANSPORT, which is meaningless on a Refresh), plus an
+  OPTIONAL LIFETIME attribute.
+
+  `lifetime-s`, when given (a non-negative integer, seconds), is sent as an
+  explicit LIFETIME attribute — per RFC 8656 §7.3 this REQUESTS that many
+  seconds. kotoba.turn.listener's `handle-refresh!` genuinely reads and
+  honors this (confirmed by reading its source: it decodes the request's
+  LIFETIME attribute, if present, and passes it straight through to
+  `kotoba.turn.allocation/refresh`'s own `:lifetime-s`) — a real asymmetry
+  with `handle-allocate!`, which never inspects a LIFETIME attribute on the
+  ORIGINAL Allocate request at all and always grants its own fixed
+  `kotoba.turn.allocation/default-lifetime-s` (600s) regardless of what a
+  client requests at Allocate time. See kotoba.dtn.transport.udp's own
+  docstring for why this asymmetry matters for how this repo's E2E demo
+  constructs a short, real, observable expiry window for its survival
+  proof (Scenario 4) despite being unable to shrink the ORIGINAL
+  Allocate's granted lifetime directly.
+
+  `lifetime-s` of `0` is a valid RFC 8656 request too (§7.3: a client that
+  wants to immediately delete an allocation sends a Refresh with LIFETIME
+  0) — this function does not special-case it, it is just another u32
+  value pushed as the LIFETIME attribute; deciding whether/when to send
+  zero is the caller's job. When `lifetime-s` is omitted (2-arg call, or an
+  explicit `nil` in the 3-arg form below), no LIFETIME attribute is sent at
+  all — RFC 8656 §7.3: an absent LIFETIME on a Refresh means 'use the
+  server's default lifetime' (currently equivalent to re-requesting 600s
+  against this listener)."
+  ([username credential txid] (build-refresh-request username credential txid nil))
+  ([username credential txid lifetime-s]
+   (-> (stun/encode-header {:typ stun/refresh-request :length 0 :txid txid})
+       (stun/push-attr stun/attr-username (b/utf8-encode username))
+       (cond-> (some? lifetime-s) (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr lifetime-s)))
+       stun/set-attr-length
+       (stun/append-message-integrity (b/utf8-encode credential))
+       stun/append-fingerprint)))
+
 (defn build-send-indication
   "STUN Send indication (RFC 8656 §10.3) wrapping payload-bytes (a
   kotoba.bytes-convention byte vector — the UTF-8 encoding of a dtn
@@ -146,6 +200,21 @@
   [attrs]
   (some-> (find-attr attrs stun/attr-xor-relayed-address) stun/decode-xor-mapped-v4))
 
+(defn response-lifetime
+  "Given a parsed STUN response's :attrs — an Allocate SUCCESS response OR a
+  Refresh SUCCESS response, both of which carry the server's ACTUAL granted
+  lifetime the same way (RFC 8656 §7.2 / §7.3) — decode its LIFETIME
+  attribute (a big-endian u32, seconds) into a plain integer, or nil when
+  the attribute is missing (e.g. this was actually an error response).
+  Never assumed/hardcoded by any caller — kotoba.dtn.transport.udp reads
+  the REAL granted lifetime via this function both right after the initial
+  Allocate (to compute its once-only refresh cadence) and after every
+  scheduled Refresh (purely for logging what the server actually granted;
+  see that namespace's docstring for why the refresh CADENCE itself is
+  deliberately NOT recomputed from later Refresh responses)."
+  [attrs]
+  (some-> (find-attr attrs stun/attr-lifetime) b/bytes->u32))
+
 (defn data-indication-payload
   "Given a parsed Data indication's :attrs, the DATA attribute's raw byte
   vector (the relayed peer's actual bytes), or nil if missing."
@@ -180,10 +249,18 @@
         decodes as a well-formed STUN message, but NOT a Data indication
         (e.g. a stray Allocate/CreatePermission response arriving after
         this node's startup handshake already consumed the one it was
-        waiting for, or a Refresh/ChannelBind response this scoped client
-        never sends a request for in the first place). Not expected on this
-        path in this repo's actual usage; the caller logs and drops it
-        rather than crashing.
+        waiting for, or — now that kotoba.dtn.transport.udp performs
+        periodic automatic Refresh, see that namespace's docstring — a
+        Refresh/CreatePermission-renewal response the node's OWN dedicated
+        refresh-reply listener already consumed by transaction id before
+        this classification/dispatch path ever sees it; either way this
+        branch's caller (the node's ONGOING, always-installed inbound
+        handler, a separate listener on the same socket) still observes
+        the same datagram too — Node's EventEmitter calls every registered
+        listener for an event, not just one — and correctly has nothing to
+        do with it. Not an error; the caller logs and drops it rather than
+        crashing. ChannelBind responses remain unreachable in practice —
+        this client still never sends ChannelBind requests.
 
     :raw-bundle — either kotoba.turn.demux/classify-datagram already says
         :channel-data or :unknown (this repo's UDP client never sends
