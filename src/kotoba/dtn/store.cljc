@@ -43,7 +43,7 @@
   kotoba.dtn.transport.tcp's own .cljs-only-behind-a-reader-conditional
   split)."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.dtn :as dtn]
             #?(:cljs ["node:fs" :as fs])))
 

@@ -16,7 +16,7 @@
   contract a routing/governor layer reasons over, not a codec.
 
   Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.phone :as phone]))
 
 ;; ---------------------------------------------------------------------------

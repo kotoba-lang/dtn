@@ -3,7 +3,7 @@
 
   Renders bundles-in-store and link-reachability records to CSV and JSON
   for audit and downstream reporting. Pure data → text: no network."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn- csv-cell [v]
   (let [s (str (if (nil? v) "" v))]
