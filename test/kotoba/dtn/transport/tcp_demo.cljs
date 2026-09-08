@@ -60,7 +60,7 @@
             ["node:fs" :as fs]
             ["node:os" :as os]
             ["node:path" :as path]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [promesa.core :as p]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.link :as link]

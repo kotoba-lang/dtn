@@ -30,7 +30,7 @@
 ;; on kotoba-lang/bytes) instead of implementing them inline.
 
 (ns dtn-node
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [promesa.core :as p]
             [nbb.core :refer [*file* invoked-file]]
             [kotoba.dtn.transport.tcp :as tcp]))
