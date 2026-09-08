@@ -52,7 +52,7 @@
   always grants its own fixed `kotoba.turn.allocation/default-lifetime-s`,
   600s, regardless of what a client asks for), but its `handle-refresh!`
   genuinely DOES read and honor a client-requested LIFETIME on Refresh."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.bytes :as b]
             [kotoba.turn.stun :as stun]
             [kotoba.turn.demux :as demux]))

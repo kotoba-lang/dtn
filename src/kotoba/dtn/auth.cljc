@@ -99,7 +99,7 @@
 
   Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             #?(:cljs ["node:crypto" :as crypto])
             #?(:cljs ["node:fs" :as fs]))
   #?(:clj (:import [javax.crypto Mac]

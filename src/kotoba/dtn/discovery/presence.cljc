@@ -70,7 +70,7 @@
   broadcast, exactly the same kind of external workaround
   `kotoba.net.transport.tcp`'s own `safe-from` already is for a different
   `kotoba.net.gossip` landmine."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.phone :as phone]))
 
 (def default-topic
