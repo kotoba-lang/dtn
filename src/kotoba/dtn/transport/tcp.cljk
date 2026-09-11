@@ -144,7 +144,7 @@
   "bundle -> a single Node Buffer: the exact wire frame
   `kotoba.wire.edn/encode` produces (4-byte BE length prefix + UTF-8
   pr-str EDN payload), converted to a Buffer so it's directly writable to
-  a raw socket. Public (not `defn-`) so test/kotoba/dtn/transport/tcp_demo.cljs
+  a raw socket. Public (not `defn-`) so test/kotoba/dtn/transport/tcp_demo.cljk
   can build a raw wire frame directly for its bundle-integrity/replay
   scenarios (sending a deliberately mis-signed or replayed bundle over a
   raw socket, bypassing send-message!'s normal signing/sequencing path)

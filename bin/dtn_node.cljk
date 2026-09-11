@@ -1,21 +1,21 @@
 ;; A minimal CLI over kotoba.dtn.transport.tcp — a demo/dev tool, NOT a
 ;; production daemon. No config file, no systemd unit, no TLS, no auth: it
 ;; binds a plain TCP socket on the given port and talks the wire framing
-;; documented in src/kotoba/dtn/transport/tcp.cljs to whatever :peer
+;; documented in src/kotoba/dtn/transport/tcp.cljk to whatever :peer
 ;; addresses you pass on the command line. Good for exercising the
 ;; internet-overlay transport by hand or from the E2E demo
-;; (test/kotoba/dtn/transport/tcp_demo.cljs) — not for running on the
+;; (test/kotoba/dtn/transport/tcp_demo.cljk) — not for running on the
 ;; open internet unmodified.
 ;;
 ;; Usage:
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
+;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
 ;;     listen --e164 +819012345678 --port 5100 \
 ;;     --peer +818098765432:localhost:5200 [--peer ...]
 ;;   ;; -> starts a long-running node; logs every message it receives into
 ;;   ;;    :inbox (a "DTN-RECV ..." line) and every retry-store! attempt
 ;;   ;;    (polled every 2s). Stays alive until killed.
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
+;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
 ;;     send --e164 +819012345678 --port 5100 \
 ;;     --peer +818098765432:localhost:5200 \
 ;;     --to +818098765432 --body "hello"

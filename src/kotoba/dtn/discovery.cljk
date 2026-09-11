@@ -21,7 +21,7 @@
   never told about each other's host:port in advance can still exchange a
   real bundle over kotoba.dtn.transport.tcp, purely because gossip-based
   discovery told them how to reach each other. See
-  test/kotoba/dtn/discovery_demo.cljs for the end-to-end proof (three real
+  test/kotoba/dtn/discovery_demo.cljk for the end-to-end proof (three real
   dtn nodes, three real gossip nodes, zero static :peers config).
 
   EXPLICITLY NOT:

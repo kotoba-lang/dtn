@@ -1,5 +1,5 @@
 ;; Not a unit test — an EXECUTABLE end-to-end demo that must genuinely pass
-;; when run. Mirrors the rigor test/kotoba/dtn/transport/tcp_demo.cljs and
+;; when run. Mirrors the rigor test/kotoba/dtn/transport/tcp_demo.cljk and
 ;; org-ietf-turn's own test/kotoba/turn/listener_demo.cljs already
 ;; established: PASS/FAIL printed per scenario, a final
 ;; "RESULT: N/4 scenarios passed" line, and `js/process.exit` 0 iff all 4
@@ -18,7 +18,7 @@
 ;; /bytes, and org-ietf-turn all checked out as siblings:
 ;;
 ;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
-;;     test/kotoba/dtn/transport/udp_turn_demo.cljs
+;;     test/kotoba/dtn/transport/udp_turn_demo.cljk
 ;;
 ;; Scenario 1 proves the new UDP transport itself works, on its own, before
 ;; TURN enters the picture at all: two dtn nodes, NEITHER behind NAT (no

@@ -530,7 +530,7 @@
   start-node!'s Promise has resolved (uses send-and-wait-for-reply! above,
   NOT the startup-only send-and-wait-once!). Public (not `defn-`) so both
   schedule-turn-refresh! (below) and a demo/test can call it directly — see
-  test/kotoba/dtn/transport/udp_turn_demo.cljs Scenario 4, which calls this
+  test/kotoba/dtn/transport/udp_turn_demo.cljk Scenario 4, which calls this
   manually (outside the normal scheduled interval) to construct its
   survival-past-expiry proof.
 
@@ -720,7 +720,7 @@
     - `:refresh-lifetime-s`, when given, makes EVERY scheduled Refresh
       request an explicit (short) LIFETIME instead of omitting it (server
       default). Combined with a short `:refresh-interval-ms`, this is how
-      test/kotoba/dtn/transport/udp_turn_demo.cljs's Scenario 4 constructs
+      test/kotoba/dtn/transport/udp_turn_demo.cljk's Scenario 4 constructs
       a short, REAL, observable expiry window at all — org-ietf-turn's
       Allocate handler ignores a client-requested LIFETIME entirely (see
       this namespace's docstring), so there is no way to get a short-lived

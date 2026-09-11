@@ -9,7 +9,7 @@
 ;; discovery told them how to reach each other. Run from this repo's root:
 ;;
 ;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
-;;     test/kotoba/dtn/discovery_demo.cljs
+;;     test/kotoba/dtn/discovery_demo.cljk
 ;;
 ;; (relative --classpath entries mean this must run with cwd at this
 ;; repo's root, with kotoba-lang/phone, /html, /css, /wire, /bytes, and
