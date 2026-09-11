@@ -12,12 +12,12 @@
 ;; modified), and real UDP socket timing (node:dgram, no simulated/mocked
 ;; sockets anywhere in this file).
 ;;
-;; Run from this repo's root (nbb, not `clojure -M:test` — this is `.cljs`,
+;; Run from this repo's root (nbb, not `kbb -M:test` — this is `.cljs`,
 ;; real socket I/O, see kotoba.dtn.transport.udp's own namespace docstring
 ;; for why that split exists), with kotoba-lang/phone, /html, /css, /wire,
 ;; /bytes, and org-ietf-turn all checked out as siblings:
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
+;;   kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
 ;;     test/kotoba/dtn/transport/udp_turn_demo.cljk
 ;;
 ;; Scenario 1 proves the new UDP transport itself works, on its own, before

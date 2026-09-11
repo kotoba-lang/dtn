@@ -64,14 +64,14 @@
 
   .cljs, NOT .cljc: depends on kotoba.net.transport.tcp (itself Node-only
   .cljs, real socket I/O) and on js/setInterval/js/clearInterval/js/Date.now.
-  Never loaded by the JVM `clojure -M:test` suite, so it cannot regress
+  Never loaded by the JVM `kbb -M:test` suite, so it cannot regress
   this repo's existing pure `.cljc` assertion count — see this repo's
   README for the current count. Only runs under a Node-hosted
   ClojureScript runtime (nbb in this repo), same as
   kotoba.dtn.transport.tcp and kotoba.net.transport.tcp themselves.
 
   PURE HELPERS live in kotoba.dtn.discovery.presence (portable .cljc,
-  covered by clojure -M:test) — announcement shape construction/
+  covered by kbb -M:test) — announcement shape construction/
   validation, self-announcement detection, translating an announcement
   into the {:host .. :port ..} shape kotoba.dtn.transport.tcp's own
   :peers already expects, and the :received-messages dedup-index math.

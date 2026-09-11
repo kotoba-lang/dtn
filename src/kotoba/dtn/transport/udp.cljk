@@ -13,9 +13,9 @@
   .cljs, NOT .cljc — real node:dgram socket I/O, same split
   kotoba.dtn.transport.tcp already establishes: only runs under a
   Node-hosted ClojureScript runtime (nbb in this repo), never loaded by the
-  JVM `clojure -M:test` suite, so this file can never regress the existing
+  JVM `kbb -M:test` suite, so this file can never regress the existing
   pure `.cljc` test suite (see kotoba.dtn.transport.turn-relay for the pure
-  helper functions this namespace DOES get real `clojure -M:test` coverage
+  helper functions this namespace DOES get real `kbb -M:test` coverage
   for).
 
   DELIBERATELY SIMPLER THAN kotoba.dtn.transport.tcp'S WIRE FORMAT for the

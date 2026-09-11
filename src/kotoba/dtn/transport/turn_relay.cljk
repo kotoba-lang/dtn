@@ -7,7 +7,7 @@
   bundle datagram. Zero I/O, zero socket/dgram/Node dependency — every
   function here takes bytes (plus a caller-injected STUN transaction id) in
   and returns a value out, so this is testable under plain JVM
-  `clojure -M:test`, same pure/impure split kotoba.turn.stun /
+  `kbb -M:test`, same pure/impure split kotoba.turn.stun /
   kotoba.turn.credential / kotoba.turn.allocation already establish in
   org-ietf-turn itself (and the same split kotoba.dtn.auth / kotoba.dtn.store
   already establish in this repo).
