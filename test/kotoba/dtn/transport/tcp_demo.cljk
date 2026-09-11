@@ -5,7 +5,7 @@
 ;; real. Run from this repo's root:
 ;;
 ;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
-;;     test/kotoba/dtn/transport/tcp_demo.cljs
+;;     test/kotoba/dtn/transport/tcp_demo.cljk
 ;;
 ;; (relative --classpath entries mean this must run with cwd at this
 ;; repo's root, with kotoba-lang/phone, /html, /css, /wire, /bytes checked
@@ -13,7 +13,7 @@
 ;; /bytes are needed because kotoba.dtn.transport.tcp delegates its wire
 ;; framing/socket-pool mechanics to kotoba.wire, built on kotoba.bytes,
 ;; instead of implementing them inline). Scenario 1 also `spawn`s a second
-;; real `nbb` process, found via $PATH, running bin/dtn_node.cljs with the
+;; real `nbb` process, found via $PATH, running bin/dtn_node.cljk with the
 ;; same --classpath.)
 ;;
 ;; Scenarios 4a/4b (added alongside this repo's durable-store +
@@ -102,7 +102,7 @@
         a-e164 "+819012345678" a-port 5201
         out-chunks (atom [])
         err-chunks (atom [])
-        child (cp/spawn "nbb" #js ["--classpath" classpath "bin/dtn_node.cljs" "listen"
+        child (cp/spawn "nbb" #js ["--classpath" classpath "bin/dtn_node.cljk" "listen"
                                     "--e164" b-e164 "--port" (str b-port)]
                          #js {:cwd (js/process.cwd)})]
     (.on (.-stdout child) "data" (fn [chunk] (swap! out-chunks conj (str chunk))))

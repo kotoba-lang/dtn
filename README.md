@@ -131,7 +131,7 @@ buildable.
 ## Internet-overlay transport (real I/O)
 
 Everything above is intentionally I/O-free — pure `.cljc` data and pure
-decisions. `kotoba.dtn.transport.tcp` (`src/kotoba/dtn/transport/tcp.cljs`)
+decisions. `kotoba.dtn.transport.tcp` (`src/kotoba/dtn/transport/tcp.cljk`)
 is the first namespace in this library that actually moves bytes between
 real OS processes: a plain TCP transport for the `:internet-overlay`
 `:dtn/transport-kind` that `kotoba.dtn.link` already models. It's `.cljs`,
@@ -435,17 +435,17 @@ the E2E demo's scenario 5, below, for a real 3-node A→B→C proof over
 actual TCP sockets, including confirmation that the intermediate relay
 node's own `:inbox` never absorbs the message.
 
-### CLI (`bin/dtn_node.cljs`)
+### CLI (`bin/dtn_node.cljk`)
 
 A minimal demo/dev tool — no config file, no systemd, no TLS:
 
 ```bash
 # Terminal 1 — long-running node, logs every received message + retry pass
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
   listen --e164 +818098765432 --port 5100
 
 # Terminal 2 — send one kotoba.rcs-shaped chat message, then exit
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljs \
+nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
   send --e164 +819012345678 --port 5101 \
   --peer +818098765432:localhost:5100 \
   --to +818098765432 --body "hello"
@@ -458,20 +458,20 @@ repo checked out next to `kotoba-lang/phone`, `/html`, `/css`, `/wire`,
 mechanics to `kotoba.wire` (`kotoba-lang/wire`, built on
 `kotoba-lang/bytes`) — see "Internet-overlay transport" above.)
 
-### E2E demo (`test/kotoba/dtn/transport/tcp_demo.cljs`)
+### E2E demo (`test/kotoba/dtn/transport/tcp_demo.cljk`)
 
 An executable proof, not a unit test — run it and read the output:
 
 ```bash
 nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
-  test/kotoba/dtn/transport/tcp_demo.cljs
+  test/kotoba/dtn/transport/tcp_demo.cljk
 ```
 
 Seven scenarios, printing `PASS`/`FAIL` per scenario and a final
 `RESULT: N/7 scenarios passed` line (exit 0 iff 7/7):
 
 1. **Real cross-process delivery** — spawns a real second `nbb` OS process
-   running `bin/dtn_node.cljs listen`, sends to its real bound port, and
+   running `bin/dtn_node.cljk listen`, sends to its real bound port, and
    confirms delivery by grepping that child process's own stdout for its
    `DTN-RECV` log line (not just checking a local return value).
 2. **Store-and-forward across a disconnect** — stops a node's server,
@@ -525,7 +525,7 @@ Seven scenarios, printing `PASS`/`FAIL` per scenario and a final
 
 Everything in "Internet-overlay transport" above still requires a peer's
 host:port to already be known via `:peers` — this namespace
-(`src/kotoba/dtn/discovery.cljs`) closes that gap: dtn nodes **announce**
+(`src/kotoba/dtn/discovery.cljk`) closes that gap: dtn nodes **announce**
 their own reachability over, and **consume** presence announcements from,
 a real [`kotoba-lang/io-libp2p`](https://github.com/kotoba-lang/io-libp2p)
 gossip mesh, populating a *running* node handle's `:peers` map
@@ -640,13 +640,13 @@ I/O via `io-libp2p`, real `js/setInterval`) and, like
 `kotoba.dtn.transport.tcp`, is never loaded by the JVM `clojure -M:test`
 suite.
 
-### E2E demo (`test/kotoba/dtn/discovery_demo.cljs`)
+### E2E demo (`test/kotoba/dtn/discovery_demo.cljk`)
 
 An executable proof, not a unit test — run it and read the output:
 
 ```bash
 nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
-  test/kotoba/dtn/discovery_demo.cljs
+  test/kotoba/dtn/discovery_demo.cljk
 ```
 
 (the `../io-libp2p/src` classpath entry, beyond what the transport demo
@@ -700,7 +700,7 @@ bridging the two was called "a materially different, larger problem than
 gossip-based discovery." This section closes that gap — honestly, at a
 genuinely scoped-down level, not with a full ICE implementation.
 
-`src/kotoba/dtn/transport/udp.cljs` (`kotoba.dtn.transport.udp`, `.cljs`,
+`src/kotoba/dtn/transport/udp.cljk` (`kotoba.dtn.transport.udp`, `.cljs`,
 Node-only, same real-I/O split every transport namespace in this repo
 uses) is a UDP-native sibling to `kotoba.dtn.transport.tcp`, deliberately
 simpler for the non-relayed case: UDP preserves datagram boundaries, so
@@ -733,7 +733,7 @@ implements). The client-side STUN-message-construction sequence
 (`build-allocate-request` / `build-create-permission-request` /
 `build-send-indication`) is adapted from org-ietf-turn's own
 `test/kotoba/turn/listener_demo.cljs` client-building pattern into a new
-pure `.cljc` namespace, `src/kotoba/dtn/transport/turn_relay.cljc`
+pure `.cljc` namespace, `src/kotoba/dtn/transport/turn_relay.cljk`
 (`kotoba.dtn.transport.turn-relay`) — zero I/O, testable under plain JVM
 `clojure -M:test` (37 of this repo's 212 total assertions), including the
 "is this inbound datagram a relayed Data indication or a directly-received
@@ -865,7 +865,7 @@ additionally requires `kotoba.turn.credential` and
 `kotoba.turn.listener`'s sibling repo checked out alongside this one, same
 pattern `phone`/`html`/`css`/`wire`/`io-libp2p` already establish.)
 
-### E2E demo (`test/kotoba/dtn/transport/udp_turn_demo.cljs`)
+### E2E demo (`test/kotoba/dtn/transport/udp_turn_demo.cljk`)
 
 An executable proof, not a unit test — run it and read the output. This is
 the most complex integration in this whole repo: three protocol layers for
@@ -875,7 +875,7 @@ real (dtn bundles, a real TURN relay, real UDP socket timing). Requires
 
 ```bash
 nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
-  test/kotoba/dtn/transport/udp_turn_demo.cljs
+  test/kotoba/dtn/transport/udp_turn_demo.cljk
 ```
 
 Four scenarios, printing `PASS`/`FAIL` per scenario and a final

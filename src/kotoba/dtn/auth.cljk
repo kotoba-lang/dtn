@@ -87,9 +87,9 @@
   -M:test`), #?(:cljs ...) uses Node's core node:crypto module (no npm
   dependency, matching kotoba.dtn.transport.tcp's existing node:net/node:fs
   convention). Both platforms are exercised for real in this repo: the
-  JVM path by test/kotoba/dtn/auth_test.cljc, the Node path by
+  JVM path by test/kotoba/dtn/auth_test.cljk, the Node path by
   kotoba.dtn.transport.tcp wiring bundles signed and verified live over a
-  real TCP socket (test/kotoba/dtn/transport/tcp_demo.cljs scenario 4b).
+  real TCP socket (test/kotoba/dtn/transport/tcp_demo.cljk scenario 4b).
   Sign and verify always run on the SAME runtime for a given
   send/receive pair in this repo's actual usage (kotoba.dtn.transport.tcp
   is Node/.cljs-only), so cross-platform pr-str byte-for-byte parity

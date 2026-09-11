@@ -1,5 +1,5 @@
-{;; nbb bundles promesa.core (see src/kotoba/dtn/transport/tcp.cljs and
- ;; test/kotoba/dtn/transport/tcp_demo.cljs) but this repo does not declare
+{;; nbb bundles promesa.core (see src/kotoba/dtn/transport/tcp.cljk and
+ ;; test/kotoba/dtn/transport/tcp_demo.cljk) but this repo does not declare
  ;; it as an mvn dependency, so clj-kondo can't analyze its macros from
  ;; source. p/let expands like clojure.core/let (sequential bindings, body);
  ;; p/do! expands like clojure.core/do — tell clj-kondo so it doesn't flag
