@@ -13,7 +13,7 @@
   crash mid-append can never corrupt earlier, already-flushed lines.
 
   This namespace splits pure logic from Node I/O so the format and
-  compaction logic stay testable under plain JVM `clojure -M:test`, same
+  compaction logic stay testable under plain JVM `kbb -M:test`, same
   as every other namespace in this library except
   `kotoba.dtn.transport.tcp` itself:
 
@@ -48,7 +48,7 @@
             #?(:cljs ["node:fs" :as fs])))
 
 ;; ---------------------------------------------------------------------------
-;; Pure format + compaction logic — testable under `clojure -M:test`
+;; Pure format + compaction logic — testable under `kbb -M:test`
 ;; ---------------------------------------------------------------------------
 
 (defn serialize-bundle

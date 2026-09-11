@@ -11,7 +11,7 @@
   None of this needs a real socket, a real clock read, or a real
   `js/setInterval` — every function here is deterministic given its
   arguments — so it stays portable `.cljc` and testable under plain JVM
-  `clojure -M:test`, mirroring the pure/impure split
+  `kbb -M:test`, mirroring the pure/impure split
   `kotoba-lang/io-libp2p`'s own `kotoba.net.transport.envelope` uses
   alongside its impure `kotoba.net.transport.tcp`, and the split
   `kotoba.dtn.auth`/`kotoba.dtn.store` already use between their portable

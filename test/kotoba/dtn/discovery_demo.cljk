@@ -8,7 +8,7 @@
 ;; exchanging a real bundle over real dtn TCP, purely because gossip-based
 ;; discovery told them how to reach each other. Run from this repo's root:
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
+;;   kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
 ;;     test/kotoba/dtn/discovery_demo.cljk
 ;;
 ;; (relative --classpath entries mean this must run with cwd at this

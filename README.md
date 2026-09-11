@@ -30,7 +30,7 @@ across JVM / ClojureScript / SCI / GraalVM.
 | | |
 |---|---|
 | Role | capability |
-| Tests | 226 assertions, all green (`clojure -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence` + 51 in `kotoba.dtn.transport.turn-relay` (37 original + 14 added alongside automatic TURN allocation/permission refresh, see below), see below) |
+| Tests | 226 assertions, all green (`kbb -M:test`, pure `.cljc` only — 147 in the original data-model/transport-support namespaces + 28 in `kotoba.dtn.discovery.presence` + 51 in `kotoba.dtn.transport.turn-relay` (37 original + 14 added alongside automatic TURN allocation/permission refresh, see below), see below) |
 | Operator console (UI/UX) | yes |
 | Export (CSV/JSON) | yes |
 | Shared CSS design system | yes (css.core/operator-theme) |
@@ -137,13 +137,13 @@ real OS processes: a plain TCP transport for the `:internet-overlay`
 `:dtn/transport-kind` that `kotoba.dtn.link` already models. It's `.cljs`,
 not `.cljc` — it only runs under a Node-hosted ClojureScript runtime
 ([`nbb`](https://github.com/babashka/nbb) in this repo) and is never
-loaded by the JVM `clojure -M:test` suite, so it cannot regress the 147
+loaded by the JVM `kbb -M:test` suite, so it cannot regress the 147
 pure-data assertions above. (`kotoba.dtn.store` and `kotoba.dtn.auth`,
 below, keep the same split: their format/canonicalization logic
 (including `kotoba.dtn.auth`'s replay-protection decision functions,
 `replay?` / `update-high-water-mark`, and its high-water-mark
 serialize/deserialize pair) is portable `.cljc` and covered by
-`clojure -M:test`, only the actual disk I/O / HMAC-vs-platform-crypto-module
+`kbb -M:test`, only the actual disk I/O / HMAC-vs-platform-crypto-module
 calls are Node-`.cljs`-specific, behind reader conditionals.)
 
 **Wire framing and socket-pool plumbing now come from
@@ -441,11 +441,11 @@ A minimal demo/dev tool — no config file, no systemd, no TLS:
 
 ```bash
 # Terminal 1 — long-running node, logs every received message + retry pass
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
+kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
   listen --e164 +818098765432 --port 5100
 
 # Terminal 2 — send one kotoba.rcs-shaped chat message, then exit
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
+kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" bin/dtn_node.cljk \
   send --e164 +819012345678 --port 5101 \
   --peer +818098765432:localhost:5100 \
   --to +818098765432 --body "hello"
@@ -463,7 +463,7 @@ mechanics to `kotoba.wire` (`kotoba-lang/wire`, built on
 An executable proof, not a unit test — run it and read the output:
 
 ```bash
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
+kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
   test/kotoba/dtn/transport/tcp_demo.cljk
 ```
 
@@ -634,10 +634,10 @@ self-announcement detection, translating an announcement into the
 `{:host .. :port ..}` shape `:peers` already expects, and the
 `:received-messages` dedup-index math) live in
 `kotoba.dtn.discovery.presence` — portable `.cljc`, covered by
-`clojure -M:test` (see Maturity table above: 28 of this repo's 175 total
+`kbb -M:test` (see Maturity table above: 28 of this repo's 175 total
 assertions). `kotoba.dtn.discovery` itself is `.cljs`-only (real socket
 I/O via `io-libp2p`, real `js/setInterval`) and, like
-`kotoba.dtn.transport.tcp`, is never loaded by the JVM `clojure -M:test`
+`kotoba.dtn.transport.tcp`, is never loaded by the JVM `kbb -M:test`
 suite.
 
 ### E2E demo (`test/kotoba/dtn/discovery_demo.cljk`)
@@ -645,7 +645,7 @@ suite.
 An executable proof, not a unit test — run it and read the output:
 
 ```bash
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
+kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../io-libp2p/src" \
   test/kotoba/dtn/discovery_demo.cljk
 ```
 
@@ -735,7 +735,7 @@ implements). The client-side STUN-message-construction sequence
 `test/kotoba/turn/listener_demo.cljs` client-building pattern into a new
 pure `.cljc` namespace, `src/kotoba/dtn/transport/turn_relay.cljk`
 (`kotoba.dtn.transport.turn-relay`) — zero I/O, testable under plain JVM
-`clojure -M:test` (37 of this repo's 212 total assertions), including the
+`kbb -M:test` (37 of this repo's 212 total assertions), including the
 "is this inbound datagram a relayed Data indication or a directly-received
 raw bundle" classification decision (`classify-inbound-datagram`) a
 TURN-relay-configured node's socket handler needs.
@@ -874,7 +874,7 @@ real (dtn bundles, a real TURN relay, real UDP socket timing). Requires
 `org-ietf-turn` checked out as siblings:
 
 ```bash
-nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
+kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src:../org-ietf-turn/src" \
   test/kotoba/dtn/transport/udp_turn_demo.cljk
 ```
 
@@ -949,5 +949,5 @@ Apache License 2.0.
 ## Test
 
 ```bash
-clojure -M:test
+kbb -M:test
 ```

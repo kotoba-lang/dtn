@@ -4,7 +4,7 @@
 ;; store-and-forward resilience property the whole design exists for is
 ;; real. Run from this repo's root:
 ;;
-;;   nbb --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
+;;   kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
 ;;     test/kotoba/dtn/transport/tcp_demo.cljk
 ;;
 ;; (relative --classpath entries mean this must run with cwd at this

@@ -9,7 +9,7 @@
 
   .cljs, NOT .cljc: it requires real socket I/O, so it only runs under a
   Node.js-hosted ClojureScript runtime (nbb in this repo). The JVM
-  `clojure -M:test` suite does not — and cannot — load `.cljs` files, so
+  `kbb -M:test` suite does not — and cannot — load `.cljs` files, so
   this namespace can never regress the existing pure `.cljc` test suite
   (see this repo's README for the current assertion count).
 
