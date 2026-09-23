@@ -141,7 +141,7 @@
   namespace only changes HOW bytes reach the wire (and, when :turn-relay is
   configured, HOW they detour through a relay first)."
   (:require ["node:dgram" :as dgram]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [promesa.core :as p]
             [kotoba.bytes :as b]
             [kotoba.turn.stun :as stun]
