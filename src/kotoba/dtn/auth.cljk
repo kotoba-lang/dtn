@@ -98,7 +98,7 @@
   one runtime process, which it is.
 
   Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.text :as str]
             #?(:cljs ["node:crypto" :as crypto])
             #?(:cljs ["node:fs" :as fs]))

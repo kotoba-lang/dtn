@@ -42,7 +42,7 @@
   pure half; the I/O half is Node-only (mirrors
   kotoba.dtn.transport.tcp's own .cljs-only-behind-a-reader-conditional
   split)."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [kotoba.lang.text :as str]
             [kotoba.dtn :as dtn]
             #?(:cljs ["node:fs" :as fs])))
