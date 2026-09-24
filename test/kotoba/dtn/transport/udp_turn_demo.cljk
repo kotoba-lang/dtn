@@ -75,7 +75,7 @@
 ;; Allocate grant, which this listener does not allow at all).
 
 (ns kotoba.dtn.transport.udp-turn-demo
-  (:require [clojure.walk :as walk]
+  (:require [kotoba.lang.coll :as walk]
             [promesa.core :as p]
             [kotoba.dtn.transport.udp :as udp]
             [kotoba.turn.listener :as listener]))
