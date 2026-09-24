@@ -1,5 +1,5 @@
 (ns kotoba.dtn-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.dtn :as dtn]))
 
 (deftest eid-test

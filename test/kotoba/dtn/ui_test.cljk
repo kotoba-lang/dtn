@@ -1,5 +1,5 @@
 (ns kotoba.dtn.ui-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.link :as link]
             [kotoba.dtn.ui :as ui]))
