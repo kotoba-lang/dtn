@@ -1,5 +1,5 @@
 (ns kotoba.dtn.auth-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.dtn :as dtn]
             [kotoba.dtn.auth :as auth]))
 

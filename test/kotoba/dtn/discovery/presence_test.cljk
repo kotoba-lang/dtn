@@ -1,5 +1,5 @@
 (ns kotoba.dtn.discovery.presence-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.dtn.discovery.presence :as presence]))
 
 (deftest presence-announcement-test

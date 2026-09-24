@@ -2,3 +2,4 @@
 /target/
 /out/
 /.clj-kondo/.cache/
+.nbb/

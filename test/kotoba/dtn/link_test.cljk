@@ -1,5 +1,5 @@
 (ns kotoba.dtn.link-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.dtn.link :as link]))
 
 (deftest link-test

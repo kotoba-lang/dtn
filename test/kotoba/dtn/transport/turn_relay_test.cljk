@@ -1,5 +1,5 @@
 (ns kotoba.dtn.transport.turn-relay-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.bytes :as b]
             [kotoba.turn.stun :as stun]
             [kotoba.turn.credential :as cred]
